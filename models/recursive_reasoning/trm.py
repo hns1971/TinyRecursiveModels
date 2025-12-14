@@ -251,9 +251,21 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         # Update data, carry (removing halted sequences)
         new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
         
-        new_steps = torch.where(carry.halted, 0, carry.steps)
+        # 不再重置 halted 样本的 steps，让它们继续推理
+        # 这样在批量训练中，即使部分样本已经完成，它们也会继续参与推理
+        # 只是后续不再计算 q_halt_loss 和统计 exact_accuracy
+        new_steps = carry.steps
 
-        new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
+        # 确保new_current_data包含batch中的所有键
+        # 对于carry.current_data中已有的键，如果halted则使用batch[k]，否则使用carry.current_data中的值
+        # 对于batch中新增的键（如labels），直接使用batch[k]
+        new_current_data = {}
+        for k in batch.keys():
+            if k in carry.current_data:
+                new_current_data[k] = torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], carry.current_data[k])
+            else:
+                # batch中新增的键（如labels），直接使用batch的值
+                new_current_data[k] = batch[k]
 
         # Forward inner model
         new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
@@ -293,5 +305,35 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
                     # Similar concept as PQN https://arxiv.org/abs/2407.04811
                     _, _, (next_q_halt_logits, next_q_continue_logits), _, _ = self.inner(new_inner_carry, new_current_data)
                     outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
+
+            # 关键修复：更新new_current_data为当前预测结果，用于下一步的递归推理
+            # 在递归推理中，每一步的输入应该是上一步的输出
+            # 只更新未halted的序列
+            not_halted = ~halted
+            if not_halted.any() and "inputs" in new_current_data:
+                # 获取预测结果（argmax of logits）
+                preds_tensor = torch.argmax(logits, dim=-1)  # [batch_size, seq_len]
+                # 对于未halted的序列，使用预测结果作为下一步的输入
+                new_current_data["inputs"] = torch.where(
+                    not_halted.view((-1, ) + (1, ) * (new_current_data["inputs"].ndim - 1)),
+                    preds_tensor,
+                    new_current_data["inputs"]
+                )
+                # 重要：对于labels，如果batch中有labels，确保new_current_data中也有labels
+                # 这样loss计算时才能访问到labels
+                # 注意：labels不应该被更新为预测结果，应该保持使用batch中的labels
+                if "labels" in batch:
+                    # 如果new_current_data中没有labels，从batch中复制
+                    if "labels" not in new_current_data:
+                        new_current_data["labels"] = batch["labels"]
+                    # 如果new_current_data中有labels，但对于未halted的序列，保持使用batch中的labels
+                    # 这样可以确保labels始终与batch中的labels一致
+                    else:
+                        # 对于未halted的序列，使用batch中的labels（不更新为预测结果）
+                        new_current_data["labels"] = torch.where(
+                            not_halted.view((-1, ) + (1, ) * (new_current_data["labels"].ndim - 1)),
+                            batch["labels"],
+                            new_current_data["labels"]
+                        )
 
         return TinyRecursiveReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs

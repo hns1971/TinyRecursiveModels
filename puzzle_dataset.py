@@ -145,6 +145,12 @@ class PuzzleDataset(IterableDataset):
 
 
     def _collate_batch(self, batch):
+        # 保存非numpy字段（如_dataset_start_idx和_dataset_set_name）
+        extra_fields = {}
+        for k in list(batch.keys()):
+            if k.startswith('_'):
+                extra_fields[k] = batch.pop(k)
+        
         # Convert dtype
         batch = {k: v.astype(np.int32) for k, v in batch.items()}
 
@@ -163,12 +169,42 @@ class PuzzleDataset(IterableDataset):
             batch = {k: np.pad(v, ((0, pad_size), ) + ((0, 0), ) * (v.ndim - 1), constant_values=pad_values[k]) for k, v in batch.items()}
 
         # To tensor
-        return {k: torch.from_numpy(v) for k, v in batch.items()}
+        result = {k: torch.from_numpy(v) for k, v in batch.items()}
+        # 添加非numpy字段（保持原始类型）
+        result.update(extra_fields)
+        return result
     
     def _iter_test(self):
         for set_i, (set_name, dataset) in enumerate(self._data.items()):  # type: ignore
-            total_examples = len(dataset["inputs"])
-
+            # 在评估模式下，只使用每道题目的第一步数据（s₀, s₁），跳过后续步骤
+            # 参考 show_addition_training_data.py 的逻辑：
+            # 对于每个puzzle_id，找到所有具有相同puzzle_identifier的样本索引
+            # 第一个索引（最小的索引）就是第一步
+            puzzle_identifiers = dataset["puzzle_identifiers"]
+            total_samples = len(dataset["inputs"])
+            
+            # 找到所有唯一的puzzle_id
+            unique_puzzle_ids = np.unique(puzzle_identifiers)
+            
+            # 对于每个puzzle_id，找到第一步的索引（最小的索引）
+            first_step_indices = []
+            puzzle_ids_list = []
+            for puzzle_id in unique_puzzle_ids:
+                # 找到所有具有相同puzzle_identifier的样本索引
+                same_puzzle_indices = np.where(puzzle_identifiers == puzzle_id)[0]
+                if len(same_puzzle_indices) > 0:
+                    # 第一个索引（最小的索引）就是第一步
+                    first_step_idx = int(np.min(same_puzzle_indices))
+                    first_step_indices.append(first_step_idx)
+                    puzzle_ids_list.append(int(puzzle_id))
+            
+            # 按索引排序，确保顺序一致
+            sorted_indices = np.argsort(first_step_indices)
+            first_step_indices = [first_step_indices[i] for i in sorted_indices]
+            puzzle_ids_list = [puzzle_ids_list[i] for i in sorted_indices]
+            
+            total_examples = len(first_step_indices)
+            
             # Load examples one by one
             start_index = 0
             while start_index < total_examples:
@@ -178,20 +214,27 @@ class PuzzleDataset(IterableDataset):
                 local_start = start_index + self.config.rank * self.local_batch_size
                 local_end   = min(start_index + (self.config.rank + 1) * self.local_batch_size, end_index)
                 
-                # Get batch of examples, and also puzzle IDs
-                puzzle_indices = []
-                puzzle_index = np.searchsorted(dataset["puzzle_indices"], local_start, side="right") - 1
-                for i in range(local_start, local_end):
-                    while puzzle_index + 1 < len(dataset["puzzle_indices"]) and i >= dataset["puzzle_indices"][puzzle_index + 1]:
-                        puzzle_index += 1
-
-                    puzzle_indices.append(puzzle_index)
+                # 获取第一步的索引
+                batch_first_step_indices = np.array(first_step_indices[local_start: local_end], dtype=np.int64)
+                
+                # 获取对应的puzzle IDs（从puzzle_ids_list中获取）
+                batch_puzzle_ids = np.array(puzzle_ids_list[local_start: local_end], dtype=np.int32)
+                
+                # puzzle_identifiers是按步骤存储的，所以应该使用first_step_idx直接索引
+                # 而不是使用puzzle_id索引
+                batch_puzzle_identifiers = dataset["puzzle_identifiers"][batch_first_step_indices]
                 
                 batch = self._collate_batch({
-                    "inputs": dataset["inputs"][local_start: local_end],
-                    "labels": dataset["labels"][local_start: local_end],
-                    "puzzle_identifiers": dataset["puzzle_identifiers"][puzzle_indices]
+                    "inputs": dataset["inputs"][batch_first_step_indices],
+                    "labels": dataset["labels"][batch_first_step_indices],
+                    "puzzle_identifiers": batch_puzzle_identifiers
                 })
+                
+                # 在测试模式下，只使用每道题目的第一步数据（s₀, s₁）
+                # 不需要保存起始索引用于加载后续步骤的label，因为后续步骤不作为评估数据
+                # 但为了兼容性，仍然保存这些字段（虽然不会被使用）
+                batch["_dataset_start_idx"] = batch_first_step_indices[0] if len(batch_first_step_indices) > 0 else 0  # 保存第一步的索引（兼容性）
+                batch["_dataset_set_name"] = set_name  # 保存set_name（兼容性）
 
                 yield set_name, batch, end_index - start_index
                 
