@@ -1,0 +1,10 @@
+__pycache__/
+checkpoints/
+data/
+logs/
+my_visualizations/
+outputs/
+failed_inputs.txt
+runs/
+test_data_visualizations/
+wandb/
