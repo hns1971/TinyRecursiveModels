@@ -193,13 +193,13 @@ def generate_addition_puzzle(num1: int, num2: int, max_len: int) -> Tuple[np.nda
             step_grid[1, :max_len] = digits2  # 第二个加数（前导位置已经是LEADING_VALUE）
             
             # 确保进位行的前导位置保持为LEADING_VALUE
-            # 进位行的最右边（个位位置）用PAD_VALUE填充，因为个位没有来自右边的进位输入
+            # 进位行的最右边（个位位置）用LEADING_VALUE填充，因为个位没有来自右边的进位输入
             leading_start = max_len - pad_to_len
             final_carry_row = carry_row.copy()
             final_carry_row[:leading_start] = LEADING_VALUE  # 前导位置保持为LEADING_VALUE
-            final_carry_row[max_len - 1] = PAD_VALUE  # 最右边（个位位置）用PAD填充，因为个位没有来自右边的进位
+            final_carry_row[max_len - 1] = LEADING_VALUE  # 最右边（个位位置）用LEADING_VALUE填充，因为个位没有来自右边的进位
             
-            step_grid[2, :] = final_carry_row  # 进位行（前导位置和个位位置是LEADING_VALUE/PAD，未计算位置是LEADING_VALUE）
+            step_grid[2, :] = final_carry_row  # 进位行（前导位置和个位位置是LEADING_VALUE，未计算位置是LEADING_VALUE）
             step_grid[3, :] = result_row.copy()  # 结果行（未计算位置是LEADING_VALUE）
             
             step_grids.append(step_grid)
@@ -279,7 +279,7 @@ def convert_subset(set_name: str, config: DataProcessConfig):
         "puzzle_identifiers": [],
         "puzzle_indices": [],
         "group_indices": [],
-        "step_counts": []  # 记录每道题目的实际步骤数
+        "puzzle_step_counts": []  # 记录每个puzzle的状态转移数
     }
     
     puzzle_id = 0
@@ -309,21 +309,68 @@ def convert_subset(set_name: str, config: DataProcessConfig):
             # input_grid 是 s₀（初始状态）
             # step_grids 是 [s₁, s₂, ..., sₜ]（每一步的状态）
             
-            # 修改：将一道题目的所有中间步骤合并到一条数据中
-            # 输入：初始状态 s₀
-            # 标签：所有中间步骤的序列拼接 [s₁, s₂, ..., sₜ]
+            # 修改：将每个状态转移作为一条数据
+            # 格式：(s₀, s₁), (s₁, s₂), (s₂, s₃), ...
+            # 输入：当前状态（前两行保持为加数，不变；后两行是当前状态的后两行）
+            # 标签：下一个状态（前两行设置为PAD，不参与损失计算）
             if len(step_grids) > 0:
-                # 将所有中间步骤的状态按顺序拼接成一个长序列
-                all_steps_flat = [step_grid.flatten() for step_grid in step_grids]
-                combined_label = np.concatenate(all_steps_flat)
+                # 从初始状态开始
+                # 当前状态是初始状态
+                current_state_grid = input_grid.copy()
                 
-                results["inputs"].append(input_grid.flatten())
-                results["labels"].append(combined_label)
-                results["step_counts"].append(len(step_grids))  # 记录实际步骤数
+                # 记录当前puzzle的状态转移数
+                num_transitions = len(step_grids)
                 
-                example_id += 1
-                results["puzzle_indices"].append(example_id)
-                results["puzzle_identifiers"].append(puzzle_id)
+                # 为每个状态转移生成一条数据
+                for next_state_grid in step_grids:
+                    # 输入：当前状态，前两行保持为加数（不变），后两行是当前状态的后两行
+                    input_state_grid = current_state_grid.copy()
+                    # 确保输入的前两行是加数（从input_grid获取）
+                    input_state_grid[0, :] = input_grid[0, :]  # 第1行保持为第一个加数
+                    input_state_grid[1, :] = input_grid[1, :]  # 第2行保持为第二个加数
+                    # 后两行保持为当前状态的后两行（已经是正确的）
+                    current_state = input_state_grid.flatten()
+                    
+                    # 标签：下一个状态，前两行保持为加数（与input一样）
+                    # 恢复label的前两行，让模型学习保持前两行不变
+                    label_grid = next_state_grid.copy()
+                    label_grid[0, :] = input_grid[0, :]  # 第1行保持为第一个加数
+                    label_grid[1, :] = input_grid[1, :]  # 第2行保持为第二个加数
+                    next_state = label_grid.flatten()
+                    
+                    # 添加状态转移对 (current_state, next_state)
+                    results["inputs"].append(current_state)
+                    results["labels"].append(next_state)
+                    
+                    example_id += 1
+                    results["puzzle_indices"].append(example_id)
+                    results["puzzle_identifiers"].append(puzzle_id)
+                    
+                    # 更新当前状态为下一个状态，用于下一个转移对
+                    # 注意：前两行保持为加数，后两行更新为下一步的状态
+                    current_state_grid = next_state_grid.copy()
+                    current_state_grid[0, :] = input_grid[0, :]  # 第1行保持为第一个加数
+                    current_state_grid[1, :] = input_grid[1, :]  # 第2行保持为第二个加数
+                
+                # 在最后一步 (s(n-1), s(n)) 之后，添加两条 (s(n), s(n)) 的数据
+                # 这样模型可以学习到什么时候应该终止（halt）
+                final_state_grid = current_state_grid.copy()  # s(n) 是最后一步的状态
+                final_state = final_state_grid.flatten()
+                
+                # 添加两条 (s(n), s(n)) 的数据
+                for _ in range(2):
+                    results["inputs"].append(final_state)
+                    results["labels"].append(final_state)  # 输入和标签相同，表示应该停止
+                    
+                    example_id += 1
+                    results["puzzle_indices"].append(example_id)
+                    results["puzzle_identifiers"].append(puzzle_id)
+                
+                # 记录当前puzzle的状态转移数（包括最后添加的2条终止数据）
+                results["puzzle_step_counts"].append(num_transitions + 2)
+            else:
+                # 如果没有步骤，记录0
+                results["puzzle_step_counts"].append(0)
             
             puzzle_id += 1
         
@@ -331,62 +378,30 @@ def convert_subset(set_name: str, config: DataProcessConfig):
         results["group_indices"].append(puzzle_id)
     
     # 转换为numpy数组
-    # 找到最大序列长度
-    max_seq_len = max(
-        max(len(inp) for inp in results["inputs"]),
-        max(len(lab) for lab in results["labels"])
-    )
+    # 新格式：每条数据是单个状态转移对 (s_i, s_{i+1})
+    # 输入和标签都是单个网格的大小（4行×grid_width列）
+    grid_size = 4 * fixed_max_len  # 单个网格的大小
     
-    # 计算每个步骤的大小（4行×grid_width列）
-    step_size = 4 * fixed_max_len
-    
-    def _pad_sequences(seq_list, step_counts_list, pad_value=PAD_VALUE):
+    def _pad_sequences(seq_list, pad_value=PAD_VALUE):
         """填充序列到相同长度
-        对于标签序列：如果题目已完成，后续步骤应该复制最终状态，而不是用PAD填充
-        这样可以避免在批量训练时，已完成题目的损失计算错误
+        新格式下，每条数据的输入和标签都是单个网格，直接填充到grid_size即可
         """
         padded = []
-        for seq, step_count in zip(seq_list, step_counts_list):
-            if len(seq) < max_seq_len:
+        for seq in seq_list:
+            if len(seq) < grid_size:
                 # 计算需要填充的长度
-                pad_len = max_seq_len - len(seq)
-                
-                # 对于标签序列：如果题目已完成，后续步骤应该复制最终状态
-                # 最终状态是最后一个步骤（step_count - 1）
-                if step_count > 0:
-                    # 获取最终状态（最后一个步骤）
-                    final_step_start = (step_count - 1) * step_size
-                    final_step_end = step_count * step_size
-                    final_step = seq[final_step_start:final_step_end]
-                    
-                    # 计算需要复制多少个完整步骤
-                    num_full_steps = pad_len // step_size
-                    remaining = pad_len % step_size
-                    
-                    # 复制最终状态
-                    pad_parts = []
-                    for _ in range(num_full_steps):
-                        pad_parts.append(final_step)
-                    if remaining > 0:
-                        pad_parts.append(final_step[:remaining])
-                    
-                    if pad_parts:
-                        padded_seq = np.concatenate([seq] + pad_parts)
-                    else:
-                        padded_seq = seq
-                else:
-                    # 如果没有步骤，用PAD填充
-                    pad = np.full(pad_len, pad_value, dtype=np.uint8)
-                    padded_seq = np.concatenate([seq, pad])
+                pad_len = grid_size - len(seq)
+                pad = np.full(pad_len, pad_value, dtype=np.uint8)
+                padded_seq = np.concatenate([seq, pad])
             else:
-                padded_seq = seq[:max_seq_len]
+                padded_seq = seq[:grid_size]
             padded.append(padded_seq)
         return np.array(padded, dtype=np.uint8)
     
     # 转换为numpy数组（值+1：数字0-9变成1-10，LEADING_VALUE(10)变成11，PAD_VALUE(11)变成12）
     results_numpy = {
-        "inputs": _pad_sequences(results["inputs"], [0] * len(results["inputs"]), pad_value=PAD_VALUE) + 1,
-        "labels": _pad_sequences(results["labels"], results["step_counts"], pad_value=PAD_VALUE) + 1,
+        "inputs": _pad_sequences(results["inputs"], pad_value=PAD_VALUE) + 1,
+        "labels": _pad_sequences(results["labels"], pad_value=PAD_VALUE) + 1,
         "group_indices": np.array(results["group_indices"], dtype=np.int32),
         "puzzle_indices": np.array(results["puzzle_indices"], dtype=np.int32),
         "puzzle_identifiers": np.array(results["puzzle_identifiers"], dtype=np.int32),
@@ -398,18 +413,19 @@ def convert_subset(set_name: str, config: DataProcessConfig):
     max_puzzle_identifier = max(results_numpy["puzzle_identifiers"]) if len(results_numpy["puzzle_identifiers"]) > 0 else 0
     num_puzzle_identifiers = max_puzzle_identifier + 1
     
-    # 计算平均步骤数（实际步骤数，不是样本数）
-    mean_steps = np.mean(results["step_counts"]) if len(results["step_counts"]) > 0 else 0
+    # 新格式下，seq_len是单个网格的大小（不再是所有步骤的拼接长度）
+    # 计算平均步骤数（每个puzzle的平均状态转移数）
+    mean_steps = np.mean(results["puzzle_step_counts"]) if len(results["puzzle_step_counts"]) > 0 else 0
     
     metadata = PuzzleDatasetMetadata(
-        seq_len=max_seq_len,
+        seq_len=grid_size,  # 单个网格的大小（4行×grid_width列）
         vocab_size=13,  # 数字1-10（值+1后的0-9） + LEADING(11，值+1后的10) + PAD(12，值+1后的11)
         pad_id=12,  # PAD_VALUE(11)值+1后变成12
         ignore_label_id=12,  # PAD应该被忽略
         blank_identifier_id=0,
         num_puzzle_identifiers=num_puzzle_identifiers,  # 使用实际的puzzle identifier数量
         total_groups=len(results_numpy["group_indices"]) - 1,
-        mean_puzzle_examples=mean_steps,  # 使用实际平均步骤数
+        mean_puzzle_examples=mean_steps,  # 每个puzzle的平均状态转移数（现在每条数据是一个转移对）
         total_puzzles=puzzle_id,
         sets=["all"]
     )
@@ -429,12 +445,12 @@ def convert_subset(set_name: str, config: DataProcessConfig):
         json.dump(["<blank>"], f)
     
     print(f"✅ {set_name}集生成完成:")
-    print(f"   - 总样本数: {len(results_numpy['inputs'])}")
+    print(f"   - 总样本数（状态转移对数）: {len(results_numpy['inputs'])}")
     print(f"   - 总puzzle数: {puzzle_id}")
-    print(f"   - 序列长度: {max_seq_len}")
-    print(f"   - 平均每个puzzle的步骤数: {mean_steps:.2f}")
-    if len(results["step_counts"]) > 0:
-        print(f"   - 步骤数范围: {min(results['step_counts'])} - {max(results['step_counts'])}")
+    print(f"   - 序列长度（单个网格大小）: {grid_size}")
+    print(f"   - 平均每个puzzle的状态转移数: {mean_steps:.2f}")
+    if len(results["puzzle_step_counts"]) > 0:
+        print(f"   - 每个puzzle的状态转移数范围: {min(results['puzzle_step_counts'])} - {max(results['puzzle_step_counts'])}")
 
 
 @cli.command(singleton=True)

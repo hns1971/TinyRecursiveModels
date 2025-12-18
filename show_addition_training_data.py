@@ -84,8 +84,21 @@ def main():
     parser.add_argument(
         "--grid-width",
         type=int,
-        required=True,
-        help="网格宽度（列数），应该等于生成数据时的max_digits"
+        default=None,
+        help="网格宽度（列数），如果未指定，从metadata的seq_len计算（seq_len // 4）"
+    )
+    
+    parser.add_argument(
+        "--show-puzzle",
+        action="store_true",
+        help="显示同一个puzzle的所有状态转移对（如果指定了puzzle_id）"
+    )
+    
+    parser.add_argument(
+        "--puzzle-id",
+        type=int,
+        default=None,
+        help="要显示的puzzle ID（如果指定，会显示该puzzle的所有状态转移对）"
     )
     
     args = parser.parse_args()
@@ -101,11 +114,17 @@ def main():
     print("=" * 60)
     print("数据集元数据")
     print("=" * 60)
-    print(f"序列长度: {metadata['seq_len']}")
+    print(f"序列长度（单个网格大小）: {metadata['seq_len']}")
     print(f"词汇表大小: {metadata['vocab_size']}")
     print(f"总组数: {metadata['total_groups']}")
     print(f"总puzzle数: {metadata['total_puzzles']}")
-    print(f"平均每个puzzle的样本数: {metadata['mean_puzzle_examples']:.2f}")
+    print(f"平均每个puzzle的状态转移数: {metadata['mean_puzzle_examples']:.2f}")
+    print()
+    
+    # 从metadata计算grid_width（如果未指定）
+    if args.grid_width is None:
+        args.grid_width = metadata['seq_len'] // 4
+        print(f"从metadata计算网格宽度: {args.grid_width}列")
     print()
     
     # 加载数据
@@ -129,6 +148,52 @@ def main():
         print(f"  puzzle_identifiers: {puzzle_identifiers.shape}")
     print()
     
+    # 前导词（LEADING_VALUE）是10（值+1后是11，减去1后是10）
+    # PAD值是11（值+1后是12，减去1后是11）
+    LEADING_VALUE = 10
+    PAD_VALUE = 11
+    
+    # 使用传入的网格宽度参数
+    grid_width = args.grid_width
+    grid_size = 4 * grid_width  # 单个网格的大小（4行×grid_width列）
+    
+    # 如果指定了puzzle_id，显示该puzzle的所有状态转移对
+    if args.puzzle_id is not None:
+        if puzzle_identifiers is None:
+            print(f"错误：数据中没有puzzle_identifiers信息")
+            return
+        
+        # 找到所有属于该puzzle的样本
+        puzzle_indices = np.where(puzzle_identifiers == args.puzzle_id)[0]
+        if len(puzzle_indices) == 0:
+            print(f"错误：找不到puzzle_id={args.puzzle_id}的样本")
+            return
+        
+        print("=" * 60)
+        print(f"Puzzle ID: {args.puzzle_id} 的所有状态转移对（共 {len(puzzle_indices)} 个）")
+        print("=" * 60)
+        
+        # 显示每个状态转移对
+        for idx, sample_idx in enumerate(puzzle_indices):
+            input_seq = inputs[sample_idx]
+            label_seq = labels[sample_idx]
+            
+            # 转换为原始值（减去1）
+            input_seq = input_seq - 1
+            label_seq = label_seq - 1
+            
+            # 重塑为网格
+            input_grid = input_seq[:grid_size].reshape(4, grid_width)
+            label_grid = label_seq[:grid_size].reshape(4, grid_width)
+            
+            print(f"\n{'=' * 60}")
+            print(f"状态转移对 #{idx + 1} (样本索引: {sample_idx})")
+            print(f"{'=' * 60}")
+            visualize_grid(input_grid, "当前状态 (s_i)", pad_value=PAD_VALUE, leading_value=LEADING_VALUE)
+            visualize_grid(label_grid, "下一个状态 (s_{i+1})", pad_value=PAD_VALUE, leading_value=LEADING_VALUE)
+        
+        return
+    
     # 检查索引范围
     if args.index >= len(inputs):
         print(f"错误：索引 {args.index} 超出范围（最大索引：{len(inputs) - 1}）")
@@ -145,148 +210,69 @@ def main():
     input_seq = input_seq - 1
     label_seq = label_seq - 1
     
-    # 前导词（LEADING_VALUE）是10（值+1后是11，减去1后是10）
-    # PAD值是11（值+1后是12，减去1后是11）
-    LEADING_VALUE = 10
-    PAD_VALUE = 11
-    
-    # 找到有效长度（去掉padding）
-    # 注意：数据生成时使用0填充，而不是PAD值（10）
-    # 所以我们需要通过其他方式确定有效长度
-    
-    # 对于输入：输入是单个网格，长度应该是4的倍数
-    # 对于标签：标签是所有中间步骤的拼接，长度应该是 step_count × (4 × grid_width)
-    
-    # 使用传入的网格宽度参数
-    grid_width = args.grid_width
-    input_grid_size = 4 * grid_width  # 输入网格的大小（4行×grid_width列）
-    
-    # 重塑输入网格（4行×grid_width列）
-    if len(input_seq) < input_grid_size:
-        print(f"错误：输入序列长度 {len(input_seq)} 小于预期的网格大小 {input_grid_size}")
+    # 重塑为网格（新格式：输入和标签都是单个网格）
+    if len(input_seq) < grid_size:
+        print(f"错误：输入序列长度 {len(input_seq)} 小于预期的网格大小 {grid_size}")
         return
     
-    input_grid = input_seq[:input_grid_size].reshape(4, grid_width)
-    
-    # 标签序列是所有中间步骤的拼接
-    # 每个步骤也是一个4行×grid_width列的网格
-    # 所以标签序列的长度应该是 step_count × (4 × grid_width)
-    step_size = 4 * grid_width  # 每个步骤的大小
-    
-    # 找到标签序列的有效长度
-    # 由于标签可能用0填充，我们需要找到最后一个非零步骤
-    label_seq_len = len(label_seq)
-    
-    # 计算可能的步骤数（向下取整）
-    num_steps = label_seq_len // step_size if step_size > 0 else 0
-    
-    # 解析标签序列为多个步骤的网格
-    step_grids = []
-    for step_idx in range(num_steps):
-        start_idx = step_idx * step_size
-        end_idx = start_idx + step_size
-        if end_idx > label_seq_len:
-            break
-        step_seq = label_seq[start_idx:end_idx]
-        step_grid = step_seq.reshape(4, grid_width)
-        
-        # 检查这个步骤是否全为零（可能是填充）
-        # 如果步骤中有非零值，或者这是第一个步骤，就添加它
-        if step_idx == 0 or np.any(step_grid != 0):
-            step_grids.append(step_grid)
-        else:
-            # 如果遇到全零的步骤，可能是填充，停止解析
-            break
+    input_grid = input_seq[:grid_size].reshape(4, grid_width)
+    label_grid = label_seq[:grid_size].reshape(4, grid_width)
     
     # 不要clip！PAD值（10）应该保持为10，数字0-9保持为0-9
     # 在显示时，我们会将PAD值（10）显示为特殊标记
     
     # 显示信息
     print("=" * 60)
-    print(f"样本 #{args.index}")
+    print(f"样本 #{args.index} (状态转移对)")
     print("=" * 60)
     if puzzle_id is not None:
         print(f"Puzzle ID: {puzzle_id}")
     print(f"网格大小: 4行 × {grid_width}列")
     print()
     
-    # 显示输入网格
-    visualize_grid(input_grid, "输入网格（初始状态 s₀）", pad_value=PAD_VALUE, leading_value=LEADING_VALUE)
+    # 显示当前状态（输入）
+    visualize_grid(input_grid, "当前状态 (s_i)", pad_value=PAD_VALUE, leading_value=LEADING_VALUE)
     
-    # 提取输入中的两个加数
-    num1 = extract_number_from_row(input_grid[0], pad_value=LEADING_VALUE)
-    num2 = extract_number_from_row(input_grid[1], pad_value=LEADING_VALUE)
-    print(f"\n解析的加数:")
-    print(f"  加数1: {num1}")
-    print(f"  加数2: {num2}")
-    print(f"  期望结果: {num1 + num2}")
+    # 显示下一个状态（标签）
+    visualize_grid(label_grid, "下一个状态 (s_{i+1})", pad_value=PAD_VALUE, leading_value=LEADING_VALUE)
     
-    # 显示所有中间步骤
-    print(f"\n{'=' * 60}")
-    print(f"标签：所有中间步骤（共 {len(step_grids)} 步）")
-    print(f"{'=' * 60}")
-    
-    if len(step_grids) == 0:
-        print("警告：标签中没有找到任何步骤")
-    else:
-        # 显示每个中间步骤
-        for step_idx, step_grid in enumerate(step_grids):
-            visualize_grid(step_grid, f"步骤 {step_idx + 1} (s_{step_idx + 1})", pad_value=PAD_VALUE, leading_value=LEADING_VALUE)
+    # 如果指定了显示同一个puzzle的所有状态转移对
+    if args.show_puzzle and puzzle_id is not None:
+        if puzzle_identifiers is None:
+            print("\n警告：数据中没有puzzle_identifiers信息，无法显示同一puzzle的其他状态转移对")
+        else:
+            # 找到所有属于该puzzle的样本
+            puzzle_indices = np.where(puzzle_identifiers == puzzle_id)[0]
+            print(f"\n{'=' * 60}")
+            print(f"Puzzle ID: {puzzle_id} 的所有状态转移对（共 {len(puzzle_indices)} 个）")
+            print(f"{'=' * 60}")
             
-            # 提取当前步骤的结果
-            result_row = step_grid[3]
-            carry_row = step_grid[2]
-            
-            # 检查是否有非前导词和非零值
-            valid_values = result_row[(result_row != LEADING_VALUE) & (result_row != PAD_VALUE) & (result_row >= 0) & (result_row <= 9)]
-            if len(valid_values) > 0:
-                # 从左边第一个非前导词、非零值开始
-                start_idx = 0
-                while start_idx < len(result_row) and (result_row[start_idx] == LEADING_VALUE or result_row[start_idx] == PAD_VALUE or result_row[start_idx] == 0):
-                    start_idx += 1
-                if start_idx < len(result_row):
-                    # 提取从start_idx到末尾的所有非前导词数字
-                    digits = [str(int(val)) for val in result_row[start_idx:] if val != LEADING_VALUE and val != PAD_VALUE and 0 <= val <= 9]
-                    if digits:
-                        result = int(''.join(digits))
-                    else:
-                        result = 0
+            # 显示每个状态转移对
+            for idx, sample_idx in enumerate(puzzle_indices):
+                if sample_idx == args.index:
+                    print(f"\n状态转移对 #{idx + 1} (样本索引: {sample_idx}) [当前样本]")
                 else:
-                    result = 0
-            else:
-                result = 0
-            
-            # 显示进位信息（将前导词显示为"F"，PAD值显示为"P"）
-            def format_row_for_display(row, leading_value=LEADING_VALUE, pad_value=PAD_VALUE):
-                result = []
-                for val in row:
-                    if val == leading_value:
-                        result.append("F")  # LEADING_VALUE显示为F
-                    elif val == pad_value:
-                        result.append("P")  # PAD_VALUE显示为P
-                    else:
-                        # 转换为Python int，避免显示np.uint8(3)这样的格式
-                        result.append(int(val))
-                return "[" + ", ".join(str(x) for x in result) + "]"
-            
-            print(f"  步骤 {step_idx + 1} 的结果: {result}")
-            if step_idx == len(step_grids) - 1:
-                # 最后一步
-                print(f"  期望最终结果: {num1 + num2}")
-                print(f"  是否正确: {'✓' if result == num1 + num2 else '✗'}")
-    
-    # 显示步骤统计信息
-    print(f"\n步骤统计:")
-    print(f"  总步骤数: {len(step_grids)}")
-    if puzzle_id is not None:
-        print(f"  Puzzle ID: {puzzle_id}")
+                    other_input_seq = inputs[sample_idx]
+                    other_label_seq = labels[sample_idx]
+                    
+                    # 转换为原始值
+                    other_input_seq = other_input_seq - 1
+                    other_label_seq = other_label_seq - 1
+                    
+                    # 重塑为网格
+                    other_input_grid = other_input_seq[:grid_size].reshape(4, grid_width)
+                    other_label_grid = other_label_seq[:grid_size].reshape(4, grid_width)
+                    
+                    print(f"\n状态转移对 #{idx + 1} (样本索引: {sample_idx})")
+                    visualize_grid(other_input_grid, "当前状态 (s_i)", pad_value=PAD_VALUE, leading_value=LEADING_VALUE)
+                    visualize_grid(other_label_grid, "下一个状态 (s_{i+1})", pad_value=PAD_VALUE, leading_value=LEADING_VALUE)
     
     # 显示原始序列信息
     print(f"\n原始序列信息:")
-    print(f"  输入序列长度: {len(input_seq)} (网格大小: {input_grid_size})")
-    print(f"  标签序列长度: {len(label_seq)} (步骤数: {len(step_grids)})")
-    print(f"  输入序列（前{min(20, input_grid_size)}个值）: {input_seq[:min(20, input_grid_size)].tolist()}")
-    print(f"  标签序列（前{min(40, len(label_seq))}个值）: {label_seq[:min(40, len(label_seq))].tolist()}")
+    print(f"  输入序列长度: {len(input_seq)} (网格大小: {grid_size})")
+    print(f"  标签序列长度: {len(label_seq)} (网格大小: {grid_size})")
+    print(f"  输入序列（前{min(20, grid_size)}个值）: {input_seq[:min(20, grid_size)].tolist()}")
+    print(f"  标签序列（前{min(20, grid_size)}个值）: {label_seq[:min(20, grid_size)].tolist()}")
 
 
 if __name__ == "__main__":

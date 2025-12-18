@@ -26,9 +26,9 @@ python -m dataset.build_addition_dataset \
   --output-dir data/addition \
   --train-size 10000 \
   --test-size 1000 \
-  --min-digits 2 \
-  --max-digits 10 \
-  --num-aug 1
+  --min-digits 1 \
+  --max-digits 8 \
+  --num-aug 0
 ```
 
 ### 参数说明

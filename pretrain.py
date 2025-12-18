@@ -1,4 +1,4 @@
-from typing import Optional, Any, Sequence, List
+from typing import Optional, Any, Sequence, List, Dict, Tuple
 from dataclasses import dataclass
 import os
 import math
@@ -80,11 +80,14 @@ class PretrainConfig(pydantic.BaseModel):
     # Extras
     seed: int = 0
     checkpoint_every_eval: bool = False
-    eval_interval: Optional[int] = None
-    min_eval_interval: Optional[int] = 0 # when to start eval
+    eval_interval: Optional[int] = None  # Evaluation interval in epochs
+    eval_interval_steps: Optional[int] = None  # Evaluation interval in steps (takes precedence over eval_interval if set)
+    min_eval_interval: Optional[int] = 0 # when to start eval (in iterations if using eval_interval, or steps if using eval_interval_steps)
     eval_save_outputs: List[str] = []
     total_steps: Optional[int] = None  # If set, override calculated total_steps
     max_eval_batches: Optional[int] = None  # Limit number of evaluation batches (for faster eval)
+    early_stopping_patience: Optional[int] = None  # Early stopping patience: stop training if metric doesn't improve for N evaluations
+    early_stopping_metric: str = "exact_accuracy"  # Metric name to monitor for early stopping
 
     ema: bool = False # use Exponential-Moving-Average
     ema_rate: float = 0.999 # EMA-rate
@@ -342,6 +345,44 @@ def save_train_state(config: PretrainConfig, train_state: TrainState):
     torch.save(train_state.model.state_dict(), os.path.join(config.checkpoint_path, f"step_{train_state.step}"))
 
 
+def _resize_puzzle_embedding_if_needed(model: nn.Module, state_dict: dict):
+    """Helper function to resize puzzle embedding in state_dict for any key format."""
+    # Get expected shape from model
+    try:
+        expected_shape: torch.Size = model.model.puzzle_emb.weights.shape  # type: ignore
+    except:
+        # If model doesn't have puzzle_emb, skip
+        return
+    
+    # Check all possible key formats for puzzle embedding
+    possible_keys = [
+        "model.inner.puzzle_emb.weights",
+        "model._orig_mod.inner.puzzle_emb.weights",
+        "_orig_mod.model.inner.puzzle_emb.weights",
+    ]
+    
+    for puzzle_emb_name in possible_keys:
+        if puzzle_emb_name in state_dict:
+            puzzle_emb = state_dict[puzzle_emb_name]
+            if puzzle_emb.shape != expected_shape:
+                print(f"Resetting puzzle embedding as shape is different. Found {puzzle_emb.shape}, Expected {expected_shape} (key: {puzzle_emb_name})")
+                # If expected shape is larger (more puzzle identifiers), expand using mean
+                if expected_shape[0] > puzzle_emb.shape[0]:
+                    # Expand: use mean of existing embeddings and replicate
+                    mean_emb = torch.mean(puzzle_emb, dim=0, keepdim=True)
+                    state_dict[puzzle_emb_name] = mean_emb.expand(expected_shape).contiguous()
+                    print(f"   ✓ Expanded puzzle_emb from {puzzle_emb.shape} to {expected_shape}")
+                elif expected_shape[0] < puzzle_emb.shape[0]:
+                    # Shrink: take first expected_shape[0] embeddings
+                    state_dict[puzzle_emb_name] = puzzle_emb[:expected_shape[0]].contiguous()
+                    print(f"   ✓ Shrunk puzzle_emb from {puzzle_emb.shape} to {expected_shape}")
+                else:
+                    # Same size but different shape (shouldn't happen, but handle it)
+                    state_dict[puzzle_emb_name] = puzzle_emb.reshape(expected_shape).contiguous()
+                    print(f"   ✓ Reshaped puzzle_emb from {puzzle_emb.shape} to {expected_shape}")
+            break  # Only resize once
+
+
 def load_checkpoint(model: nn.Module, config: PretrainConfig):
     if config.load_checkpoint is not None:
         print(f"Loading checkpoint {config.load_checkpoint}")
@@ -387,31 +428,8 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
             new_state_dict[new_key] = value
         state_dict = new_state_dict
 
-        # Resize and reset puzzle emb if needed
-        # 根据模型是否被编译，选择正确的键名
-        if is_compiled:
-            puzzle_emb_name = "model._orig_mod.inner.puzzle_emb.weights"
-        else:
-            puzzle_emb_name = "model.inner.puzzle_emb.weights"
-        expected_shape: torch.Size = model.model.puzzle_emb.weights.shape  # type: ignore
-        if puzzle_emb_name in state_dict:
-            puzzle_emb = state_dict[puzzle_emb_name]
-            if puzzle_emb.shape != expected_shape:
-                print(f"Resetting puzzle embedding as shape is different. Found {puzzle_emb.shape}, Expected {expected_shape}")
-                # If expected shape is larger (more puzzle identifiers), expand using mean
-                if expected_shape[0] > puzzle_emb.shape[0]:
-                    # Expand: use mean of existing embeddings and replicate
-                    mean_emb = torch.mean(puzzle_emb, dim=0, keepdim=True)
-                    state_dict[puzzle_emb_name] = mean_emb.expand(expected_shape).contiguous()
-                    print(f"   ✓ Expanded puzzle_emb from {puzzle_emb.shape} to {expected_shape}")
-                elif expected_shape[0] < puzzle_emb.shape[0]:
-                    # Shrink: take first expected_shape[0] embeddings
-                    state_dict[puzzle_emb_name] = puzzle_emb[:expected_shape[0]].contiguous()
-                    print(f"   ✓ Shrunk puzzle_emb from {puzzle_emb.shape} to {expected_shape}")
-                else:
-                    # Same size but different shape (shouldn't happen, but handle it)
-                    state_dict[puzzle_emb_name] = puzzle_emb.reshape(expected_shape).contiguous()
-                    print(f"   ✓ Reshaped puzzle_emb from {puzzle_emb.shape} to {expected_shape}")
+        # Resize puzzle embedding if needed (before first load attempt)
+        _resize_puzzle_embedding_if_needed(model, state_dict)
         
         # Handle vocab size mismatch for embedding and output layers
         # Get current model's vocab size
@@ -484,6 +502,7 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
         
         # 如果第一次加载失败（因为键名不匹配），尝试另一种键名格式
         # 尝试加载，如果missing_keys太多，说明键名格式不对，需要重新转换
+        _resize_puzzle_embedding_if_needed(model, state_dict)
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, assign=True, strict=False)
         first_missing_count = len(missing_keys)
         first_unexpected_count = len(unexpected_keys)
@@ -508,6 +527,7 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
                 # 如果原始键名是 _orig_mod.model.inner...，直接使用
                 if any(key.startswith("_orig_mod.model.") for key in original_state_dict.keys()):
                     print("使用原始 _orig_mod.model.inner... 格式（不转换）")
+                    _resize_puzzle_embedding_if_needed(model, original_state_dict)
                     missing_keys_orig, unexpected_keys_orig = model.load_state_dict(original_state_dict, assign=True, strict=False)
                     if len(missing_keys_orig) < first_missing_count and len(unexpected_keys_orig) < first_unexpected_count:
                         print(f"✓ 使用原始 _orig_mod.model.inner... 格式，missing_keys: {first_missing_count} -> {len(missing_keys_orig)}, unexpected_keys: {first_unexpected_count} -> {len(unexpected_keys_orig)}")
@@ -527,6 +547,7 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
                             converted_state_dict[new_key] = value
                         else:
                             converted_state_dict[key] = value
+                    _resize_puzzle_embedding_if_needed(model, converted_state_dict)
                     missing_keys_conv, unexpected_keys_conv = model.load_state_dict(converted_state_dict, assign=True, strict=False)
                     if len(missing_keys_conv) < first_missing_count and len(unexpected_keys_conv) < first_unexpected_count:
                         print(f"✓ 使用 _orig_mod.model.inner... 格式，missing_keys: {first_missing_count} -> {len(missing_keys_conv)}, unexpected_keys: {first_unexpected_count} -> {len(unexpected_keys_conv)}")
@@ -547,6 +568,7 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
                     else:
                         new_state_dict_v2[key] = value
                 # 重新加载
+                _resize_puzzle_embedding_if_needed(model, new_state_dict_v2)
                 missing_keys_v2, unexpected_keys_v2 = model.load_state_dict(new_state_dict_v2, assign=True, strict=False)
                 # 如果missing_keys和unexpected_keys都减少了，说明这个格式是对的
                 if len(missing_keys_v2) < first_missing_count and len(unexpected_keys_v2) < first_unexpected_count:
@@ -568,6 +590,7 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
                     else:
                         new_state_dict_v2[key] = value
                 # 重新加载
+                _resize_puzzle_embedding_if_needed(model, new_state_dict_v2)
                 missing_keys_v2, unexpected_keys_v2 = model.load_state_dict(new_state_dict_v2, assign=True, strict=False)
                 # 如果missing_keys和unexpected_keys都减少了，说明这个格式是对的
                 if len(missing_keys_v2) < first_missing_count and len(unexpected_keys_v2) < first_unexpected_count:
@@ -639,7 +662,12 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     # Forward with AMP
     scaler = train_state.scaler
     with autocast('cuda', dtype=torch.bfloat16, enabled=(scaler is not None)):
-        train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
+        # 传递训练步数和warmup步数给模型（用于动态loss权重）
+        # 通过batch传递，这样loss head可以访问
+        batch_with_step = batch.copy()
+        batch_with_step['_training_step'] = train_state.step
+        batch_with_step['_warmup_steps'] = config.lr_warmup_steps if hasattr(config, 'lr_warmup_steps') else 1000
+        train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch_with_step, return_keys=[])
 
     # Backward with AMP
     if scaler is not None:
@@ -696,6 +724,76 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             reduced_metrics["train/lr"] = lr_this_step
             return reduced_metrics
 
+def evaluate_single_batch(
+    model: nn.Module,
+    batch: Dict[str, Any],
+    carry: Optional[Any] = None,
+    training_step: int = 0,
+    warmup_steps: int = 1000,
+    enable_debug: bool = False,
+    rank: int = 0,
+) -> Tuple[Any, Dict[str, torch.Tensor], Dict[str, float]]:
+    """
+    评估单个 batch 的处理过程（从 evaluate 函数中抽取）
+    
+    Args:
+        model: 模型实例
+        batch: 输入 batch（字典，包含 inputs, labels 等）
+        carry: 可选的初始 carry 状态（如果为 None，会从 batch 初始化）
+        training_step: 当前训练步数（用于动态 loss 权重）
+        warmup_steps: warmup 步数（用于动态 loss 权重）
+        enable_debug: 是否启用调试输出
+        rank: 当前进程的 rank（用于控制调试输出）
+    
+    Returns:
+        tuple: (updated_carry, metrics, extracted_metrics)
+            - updated_carry: 更新后的 carry 状态（可用于下一个 batch）
+            - metrics: 模型返回的完整 metrics 字典
+            - extracted_metrics: 提取的指标字典，包含：
+                - exact_accuracy: 正确样本数（累计值）
+                - q_halt_accuracy: q_halt 正确样本数（累计值）
+                - count: 样本数
+    """
+    # To device (only for tensor values)
+    batch = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+    
+    # Init carry if it is None
+    if carry is None:
+        with torch.device("cuda"):
+            carry = model.initial_carry(batch)  # type: ignore
+    
+    # Forward (same as training)
+    # 传递训练步数和warmup步数给模型（用于动态loss权重）
+    batch_with_step = batch.copy()
+    batch_with_step['_training_step'] = training_step
+    batch_with_step['_warmup_steps'] = warmup_steps
+    
+    # 启用调试输出（如果启用）
+    if enable_debug and rank == 0:
+        # 设置调试标志
+        if hasattr(model, '_debug_eval'):
+            model._debug_eval = True
+            print(f"[评估] 已启用调试输出，将在调用底层模型前打印详细信息")
+    
+    with torch.inference_mode():
+        carry, loss, metrics, _, _ = model(carry=carry, batch=batch_with_step, return_keys=[])
+    
+    # 关闭调试输出
+    if enable_debug and hasattr(model, '_debug_eval'):
+        model._debug_eval = False
+    
+    # Extract metrics
+    extracted_metrics = {}
+    if 'exact_accuracy' in metrics:
+        extracted_metrics['exact_accuracy'] = metrics['exact_accuracy'].item()
+    if 'q_halt_accuracy' in metrics:
+        extracted_metrics['q_halt_accuracy'] = metrics['q_halt_accuracy'].item()
+    if 'count' in metrics:
+        extracted_metrics['count'] = metrics.get('count', torch.tensor(1.0)).item()
+    
+    return carry, metrics, extracted_metrics
+
+
 def evaluate(
     config: PretrainConfig,
     train_state: TrainState,
@@ -707,25 +805,23 @@ def evaluate(
     cpu_group: Optional[dist.ProcessGroup],
     eval_dataset=None,  # 添加dataset参数，用于访问原始数据
 ):
-    reduced_metrics = None
-
+    """
+    评估函数：使用训练时的 exact_accuracy 和 q_halt_accuracy 指标
+    与训练时使用相同的逻辑
+    """
+    total_exact_accuracy = 0.0
+    total_q_halt_accuracy = 0.0
+    total_count = 0
+    processed_batches = 0
+    max_batches = config.max_eval_batches
+    
     with torch.inference_mode():
-        return_keys = set(config.eval_save_outputs)
-        for evaluator in evaluators:
-            evaluator.begin_eval()
-            return_keys.update(evaluator.required_outputs)
-
-        # Run evaluation
-        set_ids = {k: idx for idx, k in enumerate(eval_metadata.sets)}
-
-        save_preds = {}
-
-        metric_keys = []
-        metric_values = None
-
         carry = None
-        processed_batches = 0
-        max_batches = config.max_eval_batches
+        
+        # 启用调试输出：打印传递给底层模型的内容（用于与单测对比）
+        # 只在第一个batch时打印，避免输出过多
+        enable_debug = True
+        debug_printed = False
         
         for set_name, batch, global_batch_size in eval_loader:
             # Limit number of batches if max_eval_batches is set
@@ -738,530 +834,77 @@ def evaluate(
             if rank == 0:
                 print(f"Processing batch {processed_batches}: {set_name}")
             
-            # To device
-            # 保存CPU副本用于后续访问（只对tensor类型的值调用clone）
-            # 同时保存非tensor字段（如_dataset_start_idx, _dataset_set_name）
-            batch_cpu = {}
-            batch_for_model = {}  # 只包含tensor字段，用于传递给模型
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    batch_cpu[k] = v.clone()
-                    batch_for_model[k] = v.cuda()
-                else:
-                    # 非tensor类型（如_dataset_start_idx, _dataset_set_name）保存到batch_cpu，但不传递给模型
-                    batch_cpu[k] = v
-            
-            # 打印batch数据信息（用于调试）
-            if rank == 0:
-                print(f"  Batch信息:")
-                batch_size = batch_cpu.get('inputs', torch.tensor([])).shape[0] if 'inputs' in batch_cpu else 0
-                print(f"    batch_size: {batch_size}")
-                if 'inputs' in batch_cpu:
-                    inputs_shape = batch_cpu['inputs'].shape
-                    print(f"    inputs shape: {inputs_shape}")
-                    # 打印前3个样本的inputs信息
-                    num_samples_to_show = min(3, inputs_shape[0])
-                    for sample_idx in range(num_samples_to_show):
-                        sample_input = batch_cpu['inputs'][sample_idx]
-                        if len(sample_input.shape) == 1:
-                            print(f"    sample {sample_idx} inputs (first 20): {sample_input[:20].tolist()}")
-                            # 尝试从inputs中提取两个加数（用于验证是否是第一步数据）
-                            try:
-                                # 转换为numpy并提取数字
-                                input_seq_np = sample_input.cpu().numpy()
-                                seq_len = len(input_seq_np)
-                                # 转换为原始值（减去1）
-                                input_seq_np = input_seq_np - 1
-                                # 重塑为网格（4行n列）
-                                grid_width = seq_len // 4
-                                if grid_width > 0:
-                                    grid = input_seq_np[:seq_len].reshape(4, grid_width)
-                                    row1 = grid[0]  # 第一个加数
-                                    row2 = grid[1]  # 第二个加数
-                                    
-                                    # 提取有效数字
-                                    def extract_num_from_row(row):
-                                        start_idx = 0
-                                        while start_idx < len(row) and row[start_idx] == 0:
-                                            start_idx += 1
-                                        if start_idx >= len(row):
-                                            return 0
-                                        digits = []
-                                        for i in range(start_idx, len(row)):
-                                            val = int(row[i])
-                                            if val >= 10:
-                                                break
-                                            digits.append(val)
-                                        if len(digits) == 0:
-                                            return 0
-                                        num = 0
-                                        for digit in digits:
-                                            num = num * 10 + digit
-                                        return num
-                                    
-                                    num1 = extract_num_from_row(row1)
-                                    num2 = extract_num_from_row(row2)
-                                    print(f"    sample {sample_idx} 提取的数字: num1={num1}, num2={num2}, 期望结果={num1 + num2}")
-                            except Exception as e:
-                                print(f"    sample {sample_idx} 无法从inputs提取数字: {e}")
-                        else:
-                            print(f"    sample {sample_idx} inputs shape: {sample_input.shape}")
-                if 'labels' in batch_cpu:
-                    labels_shape = batch_cpu['labels'].shape
-                    print(f"    labels shape: {labels_shape}")
-                    # 打印前3个样本的labels信息
-                    num_samples_to_show = min(3, labels_shape[0])
-                    for sample_idx in range(num_samples_to_show):
-                        sample_label = batch_cpu['labels'][sample_idx]
-                        if len(sample_label.shape) == 1:
-                            print(f"    sample {sample_idx} labels (first 20): {sample_label[:20].tolist()}")
-                        else:
-                            print(f"    sample {sample_idx} labels shape: {sample_label.shape}")
-                if 'puzzle_identifiers' in batch_cpu:
-                    puzzle_ids = batch_cpu['puzzle_identifiers']
-                    if isinstance(puzzle_ids, torch.Tensor):
-                        puzzle_ids_list = puzzle_ids.tolist()
-                        # 只显示前3个
-                        num_to_show = min(3, len(puzzle_ids_list))
-                        print(f"    puzzle_identifiers (first {num_to_show}): {puzzle_ids_list[:num_to_show]}")
-                        if len(puzzle_ids_list) > num_to_show:
-                            print(f"    puzzle_identifiers (total {len(puzzle_ids_list)}): {puzzle_ids_list}")
-                    else:
-                        print(f"    puzzle_identifiers: {puzzle_ids}")
-                if '_dataset_start_idx' in batch_cpu:
-                    start_idx = batch_cpu['_dataset_start_idx']
-                    if isinstance(start_idx, torch.Tensor):
-                        start_idx = start_idx.item()
-                    print(f"    _dataset_start_idx: {start_idx}")
-                if '_dataset_set_name' in batch_cpu:
-                    print(f"    _dataset_set_name: {batch_cpu['_dataset_set_name']}")
-            
-            with torch.device("cuda"):
-                carry = train_state.model.initial_carry(batch_for_model)  # type: ignore
-                # 关键修复：初始化carry，确保与test_addition_puzzle.py一致
-                # initial_carry返回的carry默认halted=True，需要设置为False才能开始推理
-                carry.halted = torch.zeros_like(carry.halted)
-                # initial_carry返回的current_data是empty_like的，需要设置为batch的值
-                # 这样第一次迭代时，如果halted=False，会使用正确的初始输入
-                carry.current_data = {k: v.clone() for k, v in batch_for_model.items()}
-                
-                # 关键修复：在第一步时，即使halted=False，也要重置inner_carry，避免使用未初始化的值
-                # 因为empty_carry创建的是未初始化的tensor，可能包含NaN
-                # 在第一步时，所有序列都应该使用初始化的carry值
-                base_model = train_state.model.model if hasattr(train_state.model, 'model') else train_state.model
-                if hasattr(base_model, 'inner') and hasattr(base_model.inner, 'reset_carry'):
-                    # 在第一步时，强制重置所有序列的carry
-                    reset_all = torch.ones_like(carry.halted, dtype=torch.bool)
-                    carry.inner_carry = base_model.inner.reset_carry(reset_all, carry.inner_carry)
-
-            # Forward
-            inference_steps = 0
-            # 保存每一步的预测，用于与label进行比较
-            all_step_preds = []  # 存储每一步的preds
-            all_step_metrics = []  # 存储每一步的metrics
-            all_step_labels = []  # 存储每一步的labels（每一步的目标状态）
-            
-            # 获取底层模型（用于推理，避免损失头可能的问题）
-            # 使用底层模型进行推理，与test_addition_puzzle.py一致，确保推理结果正确
-            base_model = train_state.model.model if hasattr(train_state.model, 'model') else train_state.model
-            
-            # 在评估模式下，始终运行到最大步数，不根据halt标记停止
-            # 这样可以确保所有样本都运行相同的步数，便于比较
-            # 注意：数据加载时已经过滤，只使用每道题目的第一步数据（s₀, s₁）
-            halt_max_steps = getattr(config.arch, 'halt_max_steps', 16)
-            
-            # 保存初始输入（用于计算exact_accuracy，因为后续步骤会更新inputs为预测结果）
-            initial_inputs = batch_for_model.get("inputs", None)
-            if initial_inputs is not None:
-                initial_inputs = initial_inputs.clone()
-            
-            while True:
-                # 使用底层模型进行推理（与test_addition_puzzle.py一致）
-                carry, outputs = base_model(carry=carry, batch=batch_for_model)
-                inference_steps += 1
-                
-                # 在评估模式下，仍然计算halt信号用于metrics，但不用于停止循环
-                if not base_model.training:
-                    # 从config获取halt配置
-                    no_ACT_continue = getattr(config.arch, 'no_ACT_continue', True)
-                    
-                    # 检查是否达到最大步数
-                    is_last_step = carry.steps >= halt_max_steps
-                    
-                    # 计算halt信号（用于metrics，但不用于停止）
-                    q_halt_logits = outputs["q_halt_logits"]
-                    
-                    # 检查q_halt_logits是否有NaN
-                    if torch.isnan(q_halt_logits).any():
-                        # 如果有NaN，将NaN位置设置为False（不halt），避免传播
-                        q_halt_logits = torch.where(torch.isnan(q_halt_logits), torch.zeros_like(q_halt_logits), q_halt_logits)
-                    
-                    if no_ACT_continue:
-                        # 如果q_halt_logits > 0，则halt
-                        halt_signal = q_halt_logits > 0
-                    else:
-                        # 如果q_halt_logits > q_continue_logits，则halt
-                        q_continue_logits = outputs.get("q_continue_logits", torch.zeros_like(q_halt_logits))
-                        # 检查q_continue_logits是否有NaN
-                        if torch.isnan(q_continue_logits).any():
-                            q_continue_logits = torch.where(torch.isnan(q_continue_logits), torch.zeros_like(q_continue_logits), q_continue_logits)
-                        halt_signal = q_halt_logits > q_continue_logits
-                    
-                    # 确保halt_signal的形状与carry.halted匹配
-                    # q_halt_logits可能是 [batch_size] 或 [batch_size, 1]
-                    if halt_signal.ndim > carry.halted.ndim:
-                        halt_signal = halt_signal.squeeze(-1)
-                    elif halt_signal.ndim < carry.halted.ndim:
-                        halt_signal = halt_signal.unsqueeze(-1)
-                    
-                    # 确保halt_signal和is_last_step的形状匹配
-                    if halt_signal.shape != carry.halted.shape:
-                        # 如果形状不匹配，尝试broadcast
-                        if halt_signal.numel() == 1:
-                            halt_signal = halt_signal.expand_as(carry.halted)
-                        elif carry.halted.numel() == 1:
-                            carry.halted = carry.halted.expand_as(halt_signal)
-                    
-                    # 更新halted状态：达到最大步数或halt信号为True（用于metrics，但不用于停止）
-                    carry.halted = is_last_step | halt_signal
-                
-                # 从outputs中提取preds
-                preds = {"preds": torch.argmax(outputs["logits"], dim=-1)}
-                
-                # 手动计算基本的metrics（不通过损失头，避免NaN问题）
-                with torch.no_grad():
-                    labels = carry.current_data.get("labels", batch_for_model.get("labels", None))
-                    
-                    # 检查是否是加法任务（通过检查损失头类型或数据路径）
-                    is_addition_task = (
-                        hasattr(train_state.model, '__class__') and 
-                        'AdditionACTLossHead' in train_state.model.__class__.__name__
-                    ) or any('addition' in str(path).lower() for path in config.data_paths)
-                    
-                    if labels is not None:
-                        mask = (labels != IGNORE_LABEL_ID)
-                        loss_counts = mask.sum(-1)
-                        loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)
-                        is_correct = mask & (preds["preds"] == labels)
-                        
-                        # 对于加法任务，exact_accuracy应该通过比较预测结果与期望结果（num1 + num2）来计算
-                        if is_addition_task:
-                            # 使用AdditionACTLossHead的逻辑：从初始输入中提取两个加数，从预测中提取结果，然后比较
-                            # 注意：必须使用初始输入（initial_inputs），因为后续步骤会更新inputs为预测结果
-                            import numpy as np
-                            # 使用初始输入，而不是batch_for_model["inputs"]（可能已被更新为预测结果）
-                            inputs = initial_inputs if initial_inputs is not None else batch_for_model.get("inputs", carry.current_data.get("inputs", None))
-                            if inputs is not None:
-                                seq_len = int(inputs.shape[-1])
-                                batch_size = int(inputs.shape[0])
-                                grid_width = seq_len // 4
-                                
-                                # 转换为原始值（值+1格式，需要减1）
-                                input_values = (inputs - 1).detach().cpu().numpy()  # B × seq_len
-                                pred_values = (preds["preds"] - 1).detach().cpu().numpy()  # B × seq_len
-                                
-                                # 重塑为网格
-                                input_grid = input_values[:, :seq_len].reshape(batch_size, 4, grid_width)
-                                pred_grid = pred_values[:, :seq_len].reshape(batch_size, 4, grid_width)
-                                
-                                # 提取两个加数和预测结果
-                                row1 = input_grid[:, 0, :]  # B × grid_width
-                                row2 = input_grid[:, 1, :]  # B × grid_width
-                                pred_row4 = pred_grid[:, 3, :]  # B × grid_width
-                                
-                                # 提取数字并比较
-                                def extract_number_from_row_np(row, valid_mask):
-                                    """从numpy数组行中提取数字"""
-                                    for i in range(len(row)):
-                                        if valid_mask[i] and row[i] != 0:
-                                            start_idx = i
-                                            break
-                                    else:
-                                        return 0
-                                    num = 0
-                                    for i in range(start_idx, len(row)):
-                                        val = int(row[i])
-                                        if val >= 10 or not valid_mask[i]:
-                                            break
-                                        num = num * 10 + val
-                                    return num
-                                
-                                seq_is_correct_list = []
-                                for b in range(batch_size):
-                                    valid_mask_row1 = (row1[b] >= 0) & (row1[b] < 10)
-                                    valid_mask_row2 = (row2[b] >= 0) & (row2[b] < 10)
-                                    valid_mask_pred = (pred_row4[b] >= 0) & (pred_row4[b] < 10)
-                                    
-                                    num1 = extract_number_from_row_np(row1[b], valid_mask_row1)
-                                    num2 = extract_number_from_row_np(row2[b], valid_mask_row2)
-                                    pred_result = extract_number_from_row_np(pred_row4[b], valid_mask_pred)
-                                    expected_result = num1 + num2
-                                    
-                                    seq_is_correct_list.append(pred_result == expected_result)
-                                
-                                seq_is_correct = torch.tensor(seq_is_correct_list, dtype=torch.bool, device=carry.halted.device)
-                            else:
-                                # 如果无法获取inputs，回退到标准逻辑
-                                seq_is_correct = is_correct.sum(-1) == loss_counts
-                        else:
-                            # 非加法任务，使用标准逻辑
-                            seq_is_correct = is_correct.sum(-1) == loss_counts
-                        
-                        valid_metrics = carry.halted & (loss_counts > 0)
-                        
-                        # 计算q_halt_accuracy：检查在halt时，q_halt_logits的预测是否正确
-                        # q_halt_logits >= 0 表示模型预测应该halt（即预测结果正确）
-                        # seq_is_correct 表示实际预测结果是否正确
-                        # 所以 q_halt_accuracy 检查：模型预测halt时，实际结果是否真的正确
-                        q_halt_logits = outputs["q_halt_logits"]
-                        # 确保q_halt_logits的形状与seq_is_correct匹配
-                        if q_halt_logits.ndim > seq_is_correct.ndim:
-                            q_halt_logits = q_halt_logits.squeeze(-1)
-                        elif q_halt_logits.ndim < seq_is_correct.ndim:
-                            q_halt_logits = q_halt_logits.unsqueeze(-1)
-                        
-                        # 处理NaN：如果有NaN，将其替换为0（表示不halt）
-                        if torch.isnan(q_halt_logits).any():
-                            q_halt_logits = torch.where(torch.isnan(q_halt_logits), torch.zeros_like(q_halt_logits), q_halt_logits)
-                        
-                        # q_halt_logits >= 0 表示模型预测应该halt（预测结果正确）
-                        q_halt_prediction = q_halt_logits >= 0
-                        # 在halt时，检查q_halt预测是否正确
-                        q_halt_correct = (q_halt_prediction == seq_is_correct)
-                        
-                        metrics = {
-                            "count": valid_metrics.sum(),
-                            "accuracy": torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum(),
-                            "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
-                            "q_halt_accuracy": (valid_metrics & q_halt_correct).sum(),
-                            "steps": torch.where(valid_metrics, carry.steps, 0).sum(),
-                        }
-                        # 计算损失（如果需要）
-                        if hasattr(train_state.model, 'loss_fn'):
-                            # 简化版损失计算
-                            loss = torch.tensor(0.0, device=carry.halted.device)  # 评估时不需要真实损失
-                        else:
-                            loss = torch.tensor(0.0, device=carry.halted.device)
-                    else:
-                        metrics = {"count": carry.halted.sum(), "steps": carry.steps.sum()}
-                        loss = torch.tensor(0.0, device=carry.halted.device)
-                
-                # 在评估模式下，只根据最大步数停止，不根据halt标记
-                # 检查是否所有序列都达到了最大步数
-                # 注意：使用inference_steps而不是carry.steps，因为halted序列的steps会被重置
-                # 确保all_finish在每次迭代中都被定义
-                all_finish = (inference_steps >= halt_max_steps) if carry.steps.numel() > 0 else True
-                
-                # 如果inference_steps达到halt_max_steps，强制退出
-                if inference_steps >= halt_max_steps:
-                    all_finish = True
-
-                # 保存每一步的预测（移到CPU以节省GPU内存）
-                all_step_preds.append({k: v.detach().cpu().clone() for k, v in preds.items()})
-                # 保存每一步的metrics（移到CPU以节省GPU内存）
-                all_step_metrics.append({k: v.detach().cpu().clone() if isinstance(v, torch.Tensor) else v for k, v in metrics.items()})
-
-                # 在评估模式下，只使用每道题目的第一步数据（s₀, s₁）
-                # 所以每一步都使用第一步的label（s₁），不需要从数据集中加载后续步骤的label
-                # 注意：虽然进行多步推理，但评估时只关心最后一步的预测结果与期望结果（num1 + num2）的比较
-                # 不需要每一步的label，因为中间步骤的数据不作为评估数据
-                if 'labels' in batch_cpu:
-                    step_label = {'labels': batch_cpu['labels'].clone()}
-                else:
-                    step_label = {}
-                
-                all_step_labels.append(step_label)
-
-                # 关键修复：更新carry.current_data和batch为当前预测结果，用于下一步的递归推理
-                # 与test_addition_puzzle.py保持一致
-                if not all_finish and 'preds' in preds:
-                    # 获取预测结果（token id格式）
-                    preds_tensor = preds['preds']  # B × seq_len
-                    
-                    # 更新carry.current_data["inputs"]为预测结果
-                    # 注意：preds_tensor是token id，应该可以直接用作inputs（因为模型输入就是token id）
-                    if 'inputs' in carry.current_data:
-                        carry.current_data["inputs"] = preds_tensor.clone()
-                    # 更新batch["inputs"]为预测结果，确保同步
-                    if 'inputs' in batch_for_model:
-                        batch_for_model["inputs"] = preds_tensor.clone()
-
-                if all_finish:
-                    break
-
-            if rank == 0:
-                print(f"  Completed inference in {inference_steps} steps")
-                # 清理GPU缓存
-                torch.cuda.empty_cache()
-
-            # 保存每一步的预测结果
-            # 每一步的预测都要与对应的label进行比较
-            # 注意：在递归推理中，每一步的预测应该与下一步的label比较
-            # 所以我们需要保存每一步的预测和对应的label
-            if len(all_step_preds) > 0:
-                # 保存每一步的预测和对应的label
-                for step_idx, (step_preds, step_labels) in enumerate(zip(all_step_preds, all_step_labels)):                    
-                    # 保存每一步的预测
-                    for k, v in step_preds.items():
-                        if k in config.eval_save_outputs:
-                            save_preds.setdefault(f"{k}_step_{step_idx}", [])
-                            save_preds[f"{k}_step_{step_idx}"].append(v.cpu())
-                    # 保存每一步的label（如果存在）
-                    for k, v in step_labels.items():
-                        if k in config.eval_save_outputs:
-                            save_preds.setdefault(f"{k}_step_{step_idx}", [])
-                            save_preds[f"{k}_step_{step_idx}"].append(v.cpu())
-                
-                # 使用最后一步的预测作为主要预测（用于保存，为了兼容性）
-                final_preds = all_step_preds[-1]
-                # 使用第一步的label作为主要label（用于保存）
-                if len(all_step_labels) > 0 and 'labels' in all_step_labels[0]:
-                    final_labels = {'labels': all_step_labels[0]['labels']}
-                else:
-                    final_labels = {}
-            else:
-                final_preds = preds
-                final_labels = {'labels': batch_cpu['labels']} if 'labels' in batch_cpu else {}
-            
-            # 保存batch和最后一步的预测（为了兼容性）
-            # 注意：使用batch_cpu而不是batch_for_model，因为batch_cpu包含所有字段（包括非tensor字段）
-            # 对于inputs，确保保存初始输入（而不是可能被更新为预测结果的batch_for_model["inputs"]）
-            for collection in (batch_cpu, final_preds):
-                for k, v in collection.items():
-                    if k in config.eval_save_outputs and isinstance(v, torch.Tensor):
-                        # 对于inputs，如果存在initial_inputs，使用initial_inputs（确保是初始输入）
-                        if k == "inputs" and initial_inputs is not None:
-                            save_preds.setdefault(k, [])
-                            save_preds[k].append(initial_inputs.cpu() if initial_inputs.is_cuda else initial_inputs)
-                        else:
-                            save_preds.setdefault(k, [])
-                            save_preds[k].append(v.cpu() if v.is_cuda else v)  # Move to CPU for saving GPU memory
-            
-            # 保存第一步的label（为了兼容性）
-            if 'labels' in final_labels and 'labels' in config.eval_save_outputs:
-                save_preds.setdefault('labels', [])
-                save_preds['labels'].append(final_labels['labels'].cpu())
-
-            # 对于评估器，需要传递每一步的预测，以便评估器能够收集所有步骤的预测和对应的q_halt_logits进行投票
-            # 评估器会使用q_halt_logits作为置信度分数，对所有步骤的预测进行排序和投票
-            # 注意：使用batch_for_model而不是batch，因为评估器期望tensor类型的数据
-            for evaluator in evaluators:
-                # 对每一步的预测都调用update_batch，让评估器收集所有步骤的预测
-                if len(all_step_preds) > 0:
-                    for step_preds in all_step_preds:
-                        evaluator.update_batch(batch_for_model, step_preds)
-                else:
-                    evaluator.update_batch(batch_for_model, final_preds)
-
-            # Aggregate metrics
-            # 使用所有步骤的metrics，而不仅仅是最后一步
-            # 这样评估器可以评估每一步的中间结果
-            set_id = set_ids[set_name]
-
-            if metric_values is None:
-                # 使用最后一步的metrics来确定keys（所有步骤的keys应该相同）
-                # 注意：如果all_step_metrics为空，使用最后一步的metrics（在循环中计算的）
-                final_metrics = all_step_metrics[-1] if len(all_step_metrics) > 0 else (metrics if 'metrics' in locals() else {})
-                metric_keys = list(
-                    sorted(final_metrics.keys())
-                )  # Sort keys to guarantee all processes use the same order.
-                metric_values = torch.zeros(
-                    (len(set_ids), len(final_metrics.values())), dtype=torch.float32, device="cuda"
-                )
-
-            # 对于exact_accuracy等指标，应该只使用最后一步（halted状态）的结果
-            # 因为只有halted=True时，valid_metrics才为True，这些指标才有意义
-            # 注意：每个batch只累加一次（使用最后一步的metrics），多个batch之间会累加
-            if len(all_step_metrics) > 0:
-                # 只使用最后一步的metrics（因为只有最后一步halted=True）
-                final_step_metrics = all_step_metrics[-1]
-                # 累加到metric_values（多个batch之间会累加）
-                # 注意：all_step_metrics在CPU上，需要移到CUDA
-                batch_metrics = torch.stack([final_step_metrics[k] for k in metric_keys]).cuda()
-                metric_values[set_id] += batch_metrics
-            else:
-                # 如果没有收集到步骤metrics，使用最后一步的metrics（向后兼容）
-                # 注意：metrics在循环中已经计算，但可能已经被删除，所以需要从all_step_metrics获取
-                if len(all_step_metrics) > 0:
-                    # all_step_metrics在CPU上，需要移到CUDA
-                    batch_metrics = torch.stack([all_step_metrics[-1][k] for k in metric_keys]).cuda()
-                else:
-                    # 如果all_step_metrics也为空，创建一个零metrics（不应该发生）
-                    batch_metrics = torch.zeros(len(metric_keys), dtype=torch.float32, device="cuda")
-                metric_values[set_id] += batch_metrics
-
-            # 清理内存
-            del carry, loss, preds, batch_for_model, all_finish, all_step_preds, all_step_labels
-            if 'metrics' in locals():
-                del metrics
-            del all_step_metrics
-            # all_step_preds和all_step_labels在后面还会用到，在处理完后再删除
-            # 但我们已经将它们移到CPU了，所以GPU内存应该已经释放
-            torch.cuda.empty_cache()
-
-        # concatenate save preds
-        save_preds = {k: torch.cat(v, dim=0) for k, v in save_preds.items()}
-
-        # Save preds
-        if config.checkpoint_path is not None and len(save_preds):
-            # Each rank save predictions independently
-            os.makedirs(os.path.dirname(config.checkpoint_path), exist_ok=True)
-            torch.save(
-                save_preds, os.path.join(config.checkpoint_path, f"step_{train_state.step}_all_preds.{rank}")
+            # 使用抽取的单个 batch 处理函数
+            enable_debug_this_batch = enable_debug and not debug_printed
+            carry, metrics, extracted_metrics = evaluate_single_batch(
+                model=train_state.model,
+                batch=batch,
+                carry=carry,
+                training_step=train_state.step,
+                warmup_steps=config.lr_warmup_steps if hasattr(config, 'lr_warmup_steps') else 1000,
+                enable_debug=enable_debug_this_batch,
+                rank=rank,
             )
-
-        del save_preds
-
-        # Reduce to rank 0
-        if metric_values is not None:
-            if world_size > 1:
-                dist.reduce(metric_values, dst=0)
-
-            if rank == 0:
-                reduced_metrics = metric_values.cpu().numpy()
-                reduced_metrics = {
-                    set_name: {
-                        metric_name: reduced_metrics[set_id, metric_id]
-                        for metric_id, metric_name in enumerate(metric_keys)
-                    }
-                    for set_id, set_name in enumerate(set_ids)
-                }
-
-                # Postprocess
-                for set_name, m in reduced_metrics.items():
-                    count = m.pop("count")
-                    reduced_metrics[set_name] = {k: v / count if count > 0 else 0.0 for k, v in m.items()}
-
-        # Run evaluators
-        if rank == 0:
-            print(f"\nRunning {len(evaluators)} evaluator(s)...")
             
-        for i, evaluator in enumerate(evaluators):
-            if rank == 0:
-                print(f"Running evaluator {i+1}/{len(evaluators)}: {evaluator.__class__.__name__}")
-                
-            # Path for saving
-            evaluator_save_path = None
-            if config.checkpoint_path is not None:
-                evaluator_save_path = os.path.join(
-                    config.checkpoint_path,
-                    f"evaluator_{evaluator.__class__.__name__}_step_{train_state.step}",
-                )
-                os.makedirs(evaluator_save_path, exist_ok=True)
-
-            # Run and log
-            metrics = evaluator.result(evaluator_save_path, rank=rank, world_size=world_size, group=cpu_group)
-            if rank == 0 and metrics is not None:
-                if reduced_metrics is None:
-                    reduced_metrics = {}
-
-                reduced_metrics.update(metrics)
-                print(f"  Completed {evaluator.__class__.__name__}")
-                
+            if enable_debug_this_batch:
+                debug_printed = True
+            
+            # 累计指标
+            if 'exact_accuracy' in extracted_metrics:
+                total_exact_accuracy += extracted_metrics['exact_accuracy']
+            if 'q_halt_accuracy' in extracted_metrics:
+                total_q_halt_accuracy += extracted_metrics['q_halt_accuracy']
+            if 'count' in extracted_metrics:
+                total_count += extracted_metrics['count']
+            
+            # Clean up
+            del metrics, batch
+            # Note: don't delete carry here, as it's reused in the next iteration
+            torch.cuda.empty_cache()
+        
+        # Clean up carry after evaluation loop
+        del carry
+        torch.cuda.empty_cache()
+        
+        # Reduce metrics across processes
+        if world_size > 1:
+            total_exact_accuracy_tensor = torch.tensor(total_exact_accuracy, device='cuda')
+            total_q_halt_accuracy_tensor = torch.tensor(total_q_halt_accuracy, device='cuda')
+            total_count_tensor = torch.tensor(total_count, device='cuda')
+            dist.all_reduce(total_exact_accuracy_tensor)
+            dist.all_reduce(total_q_halt_accuracy_tensor)
+            dist.all_reduce(total_count_tensor)
+            total_exact_accuracy = total_exact_accuracy_tensor.item()
+            total_q_halt_accuracy = total_q_halt_accuracy_tensor.item()
+            total_count = total_count_tensor.item()
+            # Clean up tensors after all_reduce
+            del total_exact_accuracy_tensor, total_q_halt_accuracy_tensor, total_count_tensor
+            torch.cuda.empty_cache()
+        
+        # Calculate final metrics
         if rank == 0:
-            print("All evaluators completed!")
-
-    return reduced_metrics
+            # exact_accuracy 和 q_halt_accuracy 是累计值（正确样本数），需要除以 total_count 得到比例
+            if total_count > 0:
+                final_exact_accuracy = total_exact_accuracy / total_count
+                final_q_halt_accuracy = total_q_halt_accuracy / total_count
+            else:
+                final_exact_accuracy = 0.0
+                final_q_halt_accuracy = 0.0
+            
+            reduced_metrics = {
+                'all': {
+                    'exact_accuracy': final_exact_accuracy,
+                    'q_halt_accuracy': final_q_halt_accuracy,
+                    'count': total_count
+                }
+            }
+            print(f"\nEvaluation Results:")
+            print(f"  exact_accuracy: {final_exact_accuracy:.4f} (正确样本数: {total_exact_accuracy:.0f}, 总样本数: {total_count:.0f})")
+            print(f"  q_halt_accuracy: {final_q_halt_accuracy:.4f} (正确样本数: {total_q_halt_accuracy:.0f}, 总样本数: {total_count:.0f})")
+            print(f"  count: {total_count}")
+            return reduced_metrics
+        else:
+            return None
 
 def save_code_and_config(config: PretrainConfig):
     if config.checkpoint_path is None or wandb.run is None:
@@ -1367,11 +1010,20 @@ def launch(hydra_config: DictConfig):
         # Override epochs with calculated value
         config.epochs = calculated_epochs
     
-    train_epochs_per_iter = config.eval_interval if config.eval_interval is not None else config.epochs
-    total_iters = config.epochs // train_epochs_per_iter
+    # 如果设置了eval_interval_steps，不需要按epochs分割训练
+    # 如果只设置了eval_interval，按原逻辑分割训练
+    if config.eval_interval_steps is not None:
+        # 按步数评估，不需要按epochs分割，整个训练作为一个iter
+        train_epochs_per_iter = config.epochs
+        total_iters = 1
+        if RANK == 0:
+            print(f"ℹ️  使用按步数评估模式: eval_interval_steps={config.eval_interval_steps}")
+    else:
+        train_epochs_per_iter = config.eval_interval if config.eval_interval is not None else config.epochs
+        total_iters = config.epochs // train_epochs_per_iter
 
-    # Adjust eval_interval if needed to make it a divisor of epochs
-    if config.epochs % train_epochs_per_iter != 0:
+    # Adjust eval_interval if needed to make it a divisor of epochs (only if using eval_interval)
+    if config.eval_interval_steps is None and config.epochs % train_epochs_per_iter != 0:
         if RANK == 0:
             print(f"⚠️  Warning: eval_interval ({train_epochs_per_iter}) is not a divisor of epochs ({config.epochs})")
             # Find the largest divisor of epochs that is <= eval_interval
@@ -1401,6 +1053,14 @@ def launch(hydra_config: DictConfig):
 
     # Train state
     train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE)
+    
+    # Track last evaluation step for eval_interval_steps
+    last_eval_step = 0
+    
+    # Early stopping tracking
+    best_metric_value = None
+    patience_counter = 0
+    early_stopping_enabled = config.early_stopping_patience is not None and config.early_stopping_patience > 0
 
     # Progress bar and logger
     progress_bar = None
@@ -1408,7 +1068,7 @@ def launch(hydra_config: DictConfig):
     tb_writer = None
     if RANK == 0:
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
-        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
+        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True, init_timeout=120))  # type: ignore
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
         # 初始化TensorBoard writer
         tb_log_dir = os.path.join("runs", config.run_name)
@@ -1436,6 +1096,8 @@ def launch(hydra_config: DictConfig):
         
         # Track if we processed any batches in this iteration
         batches_processed = False
+        # Flag to indicate if we need to evaluate after processing batches
+        need_eval_after_batches = False
         for set_name, batch, global_batch_size in train_loader:
             # Check if we've reached total_steps
             if config.total_steps is not None and train_state.step >= train_state.total_steps:
@@ -1469,6 +1131,18 @@ def launch(hydra_config: DictConfig):
                 if RANK == 0:
                     print(f"Reached total_steps ({config.total_steps}), stopping training")
                 break
+            
+            # 如果使用 eval_interval_steps，在每个 batch 后检查是否应该评估
+            # 注意：如果设置了 eval_interval_steps，应该立即触发评估，而不是等到 iter 结束
+            # 这样可以确保按步数准确触发评估
+            if config.eval_interval_steps is not None:
+                min_eval_steps = config.min_eval_interval if config.min_eval_interval is not None else 0
+                if train_state.step >= min_eval_steps:
+                    steps_since_last_eval = train_state.step - last_eval_step
+                    if steps_since_last_eval >= config.eval_interval_steps:
+                        # 需要评估，立即跳出 batch 循环，进入评估逻辑
+                        need_eval_after_batches = True
+                        break
         
         # If using total_steps and we haven't reached it yet, but no more batches,
         # we need to recreate the dataloader to continue
@@ -1487,16 +1161,27 @@ def launch(hydra_config: DictConfig):
         else:
             is_training_complete = (_iter_id >= total_iters)
         
-        # 评估逻辑：如果设置了eval_interval，按原逻辑；否则只在训练完成后评估
-        # 如果用户想要只在训练完成后评估，可以设置eval_interval=None
+        # 评估逻辑：
+        # 1. 如果设置了eval_interval_steps，按步数触发评估（优先级最高）
+        #    注意：如果使用eval_interval_steps，评估检查已经在batch循环内进行，这里检查标志或训练完成
+        # 2. 如果设置了eval_interval，按epochs/iterations触发评估
+        # 3. 否则只在训练完成后评估
         should_eval = False
-        if config.eval_interval is None:
-            # 如果没有设置eval_interval，只在训练完成后评估
-            should_eval = is_training_complete
-        else:
-            # 如果设置了eval_interval，按原逻辑（中间评估 + 最后评估）
+        if config.eval_interval_steps is not None:
+            # 按步数触发评估
+            # 检查标志（在batch循环内设置的）或训练完成
+            if need_eval_after_batches:
+                should_eval = True
+            # 训练完成时也要评估
+            if is_training_complete:
+                should_eval = True
+        elif config.eval_interval is not None:
+            # 按epochs/iterations触发评估（原逻辑）
             # 但也要确保在训练完成时评估
             should_eval = (_iter_id >= config.min_eval_interval) or is_training_complete
+        else:
+            # 如果没有设置eval_interval或eval_interval_steps，只在训练完成后评估
+            should_eval = is_training_complete
         
         if should_eval:
             ############ Evaluation
@@ -1504,11 +1189,31 @@ def launch(hydra_config: DictConfig):
                 if is_training_complete:
                     print("EVALUATE (Training Complete)")
                 else:
-                    print("EVALUATE")
+                    if config.eval_interval_steps is not None:
+                        print(f"EVALUATE (Step {train_state.step}, interval: {config.eval_interval_steps} steps)")
+                    else:
+                        print("EVALUATE")
+            # Update last evaluation step
+            last_eval_step = train_state.step
+            # Reset the flag after evaluation
+            need_eval_after_batches = False
             if config.ema:
                 print("SWITCH TO EMA")
-                train_state_eval = copy.deepcopy(train_state)
-                train_state_eval.model = ema_helper.ema_copy(train_state_eval.model)
+                # 清理 GPU 缓存以释放内存
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                # 创建新的 TrainState，只复制必要的字段，避免 deepcopy 整个对象
+                # 这样可以减少内存占用
+                train_state_eval = TrainState(
+                    model=ema_helper.ema_copy(train_state.model),
+                    optimizers=train_state.optimizers,  # 评估时不需要 optimizers，但保持引用避免被回收
+                    optimizer_lrs=train_state.optimizer_lrs,  # 评估时不需要
+                    step=train_state.step,
+                    total_steps=train_state.total_steps,
+                    carry=None,  # 评估时会重新初始化
+                    scaler=train_state.scaler,  # 评估时不需要 scaler
+                )
             else:
                 train_state_eval = train_state
             train_state_eval.model.eval()
@@ -1530,6 +1235,33 @@ def launch(hydra_config: DictConfig):
                         if isinstance(value, (int, float)):
                             tb_writer.add_scalar(f"eval/{key}", value, train_state.step)
                 
+                # Early stopping check
+                if early_stopping_enabled:
+                    # Extract metric value from metrics dict
+                    # metrics structure: {'all': {'exact_accuracy': value, ...}}
+                    metric_value = None
+                    if 'all' in metrics and config.early_stopping_metric in metrics['all']:
+                        metric_value = metrics['all'][config.early_stopping_metric]
+                    elif config.early_stopping_metric in metrics:
+                        metric_value = metrics[config.early_stopping_metric]
+                    
+                    if metric_value is not None:
+                        if best_metric_value is None or metric_value > best_metric_value:
+                            # Metric improved
+                            best_metric_value = metric_value
+                            patience_counter = 0
+                            print(f"✅ Early stopping: {config.early_stopping_metric} improved to {metric_value:.4f} (best: {best_metric_value:.4f}, patience: {patience_counter}/{config.early_stopping_patience})")
+                        else:
+                            # Metric didn't improve
+                            patience_counter += 1
+                            print(f"⚠️  Early stopping: {config.early_stopping_metric} = {metric_value:.4f} (best: {best_metric_value:.4f}, patience: {patience_counter}/{config.early_stopping_patience})")
+                            
+                            if patience_counter >= config.early_stopping_patience:
+                                print(f"🛑 Early stopping triggered: {config.early_stopping_metric} hasn't improved for {config.early_stopping_patience} evaluations")
+                                print(f"   Best {config.early_stopping_metric}: {best_metric_value:.4f}")
+                                print(f"   Current {config.early_stopping_metric}: {metric_value:.4f}")
+                                is_training_complete = True  # Trigger training completion to save checkpoint and exit
+                
             ############ Checkpointing
             if RANK == 0:
                 print("SAVE CHECKPOINT")
@@ -1538,13 +1270,32 @@ def launch(hydra_config: DictConfig):
 
             if config.ema:
                 del train_state_eval
+                # 清理GPU缓存以释放EMA模型占用的内存
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+            
+            # 重置训练状态的carry，确保下次训练时重新初始化
+            # 这样可以避免评估时的carry状态影响训练，并释放内存
+            train_state.carry = None
+            # 强制清理GPU缓存
+            torch.cuda.empty_cache()
             
             # 如果训练完成，退出循环
             if is_training_complete:
                 break
+            
+            # 如果使用 eval_interval_steps 并且刚刚评估过，继续训练（不增加 iter_id）
+            # 这样可以继续处理剩余的 batches，而不是重新开始 iter
+            if config.eval_interval_steps is not None:
+                # 评估完成，继续当前 iter 的训练（重新进入 batch 循环）
+                continue
         
-        # Increment iteration counter
-        _iter_id += 1
+        # Increment iteration counter (only if not using eval_interval_steps or if iter is complete)
+        if config.eval_interval_steps is None:
+            _iter_id += 1
+        # 如果使用 eval_interval_steps，只有在真正完成 iter 时才增加
+        # 如果是因为评估而跳出，不增加 iter_id（已经在上面 continue 了）
         
         # Check if we've reached total_steps (for total_steps-based training)
         if config.total_steps is not None and train_state.step >= train_state.total_steps:

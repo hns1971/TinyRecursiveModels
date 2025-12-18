@@ -61,6 +61,7 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     mlp_t: bool = False # use mlp on L instead of transformer
     puzzle_emb_len: int = 16 # if non-zero, its specified to this value
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
+    force_max_steps_during_training: bool = False # If True, always run full max_steps during training, ignoring early halt signals
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
@@ -237,34 +238,71 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
     def initial_carry(self, batch: Dict[str, torch.Tensor]):
         batch_size = batch["inputs"].shape[0]
 
+        # 初始化current_data
+        # 关键修复：labels和inputs应该使用batch中的值，而不是empty_like（empty_like会创建未初始化的tensor，值可能是随机的内存内容）
+        # labels应该使用inputs的值（因为这是一步推理，inputs包含输入及初始状态）
+        current_data = {}
+        for k, v in batch.items():
+            if k == "labels":
+                # labels应该使用inputs的值（因为这是一步推理，inputs包含输入及初始状态）
+                # 数据里的labels是答案（目标状态），不是当前状态
+                if "inputs" in batch:
+                    current_data[k] = batch["inputs"].clone() if isinstance(batch["inputs"], torch.Tensor) else batch["inputs"]
+                else:
+                    current_data[k] = v.clone() if isinstance(v, torch.Tensor) else v
+            elif k == "inputs":
+                # inputs应该直接使用batch中的值（完整的4行，初始状态）
+                current_data[k] = v.clone() if isinstance(v, torch.Tensor) else v
+            else:
+                current_data[k] = torch.empty_like(v) if isinstance(v, torch.Tensor) else v
+
         return TinyRecursiveReasoningModel_ACTV1Carry(
             inner_carry=self.inner.empty_carry(batch_size),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
             
             steps=torch.zeros((batch_size, ), dtype=torch.int32),
             halted=torch.ones((batch_size, ), dtype=torch.bool),  # Default to halted
             
-            current_data={k: torch.empty_like(v) for k, v in batch.items()}
+            current_data=current_data
         )
         
     def forward(self, carry: TinyRecursiveReasoningModel_ACTV1Carry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1Carry, Dict[str, torch.Tensor]]:
 
+        # 关键修复：检查是否已经达到或超过最大推理步数
+        # 确保每条数据在达到halt_max_steps后停止推理，不会继续增加steps
+        already_reached_max = carry.steps >= self.config.halt_max_steps
+        
         # Update data, carry (removing halted sequences)
-        new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
+        # 如果样本已经达到halt_max_steps，必须保持halted状态
+        force_halted = already_reached_max | carry.halted
+        new_inner_carry = self.inner.reset_carry(force_halted, carry.inner_carry)
         
         # 不再重置 halted 样本的 steps，让它们继续推理
         # 这样在批量训练中，即使部分样本已经完成，它们也会继续参与推理
         # 只是后续不再计算 q_halt_loss 和统计 exact_accuracy
+        # 但是，如果样本已经达到halt_max_steps，不能继续增加steps
         new_steps = carry.steps
 
         # 确保new_current_data包含batch中的所有键
-        # 对于carry.current_data中已有的键，如果halted则使用batch[k]，否则使用carry.current_data中的值
+        # 对于carry.current_data中已有的键，如果halted或已达到最大步数则使用batch[k]，否则使用carry.current_data中的值
         # 对于batch中新增的键（如labels），直接使用batch[k]
+        # 关键修复：如果样本已经达到halt_max_steps，使用新batch数据（表示开始处理新数据），但保持halted状态
+        # 特殊处理：labels应该始终使用carry.current_data中的值（上一步的计算结果），用于损失计算中的不变部分比较
         new_current_data = {}
         for k in batch.keys():
-            if k in carry.current_data:
-                new_current_data[k] = torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], carry.current_data[k])
+            if k == "labels":
+                # labels特殊处理：始终使用carry.current_data中的labels（上一步的计算结果）
+                # 这样损失函数可以正确比较不变部分和变换部分
+                if k in carry.current_data:
+                    new_current_data[k] = carry.current_data[k]
+                else:
+                    # 如果carry.current_data中没有labels，使用batch中的labels（初始状态）
+                    new_current_data[k] = batch[k]
+            elif k in carry.current_data:
+                # 如果halted或已达到最大步数，使用新batch数据
+                use_new_batch = force_halted.view((-1, ) + (1, ) * (batch[k].ndim - 1))
+                new_current_data[k] = torch.where(use_new_batch, batch[k], carry.current_data[k])
             else:
-                # batch中新增的键（如labels），直接使用batch的值
+                # batch中新增的键（除了labels），直接使用batch的值
                 new_current_data[k] = batch[k]
 
         # Forward inner model
@@ -278,13 +316,19 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
 
         with torch.no_grad():
             # Step
-            new_steps = new_steps + 1
+            # 关键修复：如果样本已经达到halt_max_steps，不能继续增加steps
+            # 只有未达到最大步数的样本才增加steps
+            can_increment_steps = ~already_reached_max
+            new_steps = torch.where(can_increment_steps, new_steps + 1, new_steps)
             is_last_step = new_steps >= self.config.halt_max_steps
             
-            halted = is_last_step
+            # 强制停止：如果达到或超过最大推理步数，必须halted
+            # 确保每条数据在达到halt_max_steps后停止推理，不会继续推理
+            halted = is_last_step | already_reached_max
 
             # if training, and ACT is enabled
-            if self.training and (self.config.halt_max_steps > 1):
+            # If force_max_steps_during_training is True, skip early halt logic during training
+            if self.training and (self.config.halt_max_steps > 1) and not self.config.force_max_steps_during_training:
 
                 # Halt signal
                 # NOTE: During evaluation, always use max steps, this is to guarantee the same halting steps inside a batch for batching purposes
@@ -319,21 +363,14 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
                     preds_tensor,
                     new_current_data["inputs"]
                 )
-                # 重要：对于labels，如果batch中有labels，确保new_current_data中也有labels
-                # 这样loss计算时才能访问到labels
-                # 注意：labels不应该被更新为预测结果，应该保持使用batch中的labels
-                if "labels" in batch:
-                    # 如果new_current_data中没有labels，从batch中复制
-                    if "labels" not in new_current_data:
-                        new_current_data["labels"] = batch["labels"]
-                    # 如果new_current_data中有labels，但对于未halted的序列，保持使用batch中的labels
-                    # 这样可以确保labels始终与batch中的labels一致
-                    else:
-                        # 对于未halted的序列，使用batch中的labels（不更新为预测结果）
-                        new_current_data["labels"] = torch.where(
-                            not_halted.view((-1, ) + (1, ) * (new_current_data["labels"].ndim - 1)),
-                            batch["labels"],
-                            new_current_data["labels"]
-                        )
+                # 重要：对于labels，更新为当前预测结果（上一步的输出），用于下一步的输入
+                # 这样下一步时，carry.current_data["labels"]会包含上一步的预测结果
+                if "labels" in new_current_data:
+                    # 对于未halted的序列，使用预测结果作为下一步的labels（上一步的计算结果）
+                    new_current_data["labels"] = torch.where(
+                        not_halted.view((-1, ) + (1, ) * (new_current_data["labels"].ndim - 1)),
+                        preds_tensor,  # 使用预测结果
+                        new_current_data["labels"]
+                    )
 
         return TinyRecursiveReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs

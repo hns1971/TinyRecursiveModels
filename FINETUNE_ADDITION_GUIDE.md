@@ -146,10 +146,10 @@ python finetune_addition.py \
 # 第一步：只训练embeddings
 python finetune_addition.py \
     --base-checkpoint checkpoints/Arc1concept-aug-1000-ACT-torch/my_training_run/step_303191 \
-    --data-path data/addition_fixed \
+    --data-path data/addition \
     --run-name finetune_addition_step1 \
     --freeze-weights \
-    --total-steps 3000 \
+    --total-steps 1000 \
     --eval-interval 1500 \
     --puzzle-emb-lr 1e-2 \
     --copy-loss-weight 0 \
@@ -157,12 +157,22 @@ python finetune_addition.py \
 
 # 第二步：全参数微调
 python finetune_addition.py \
-    --base-checkpoint checkpoints/Addition_fixed-ACT-torch/finetune_addition_step1/step_3000 \
-    --data-path data/addition_fixed \
+    --base-checkpoint checkpoints/Addition-ACT-torch/finetune_addition_step1/step_3000 \
+    --data-path data/addition \
     --run-name finetune_addition_step2 \
     --lr 5e-5 \
-    --total-steps 25000 \
-    --eval-interval 5000 \
+    --total-steps 1000 \
+    --global-batch-size 64 \
+    --ema
+
+# 第三步：微调halt头
+python finetune_addition.py \
+    --base-checkpoint checkpoints/Addition-ACT-torch/finetune_addition_step2/step_16000 \
+    --data-path data/addition \
+    --run-name finetune_addition_step3 \
+    --lr 5e-5 \
+    --total-steps 15000 \
+    --global-batch-size 64 \
     --ema
 ```
 

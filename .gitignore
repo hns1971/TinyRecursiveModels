@@ -8,3 +8,4 @@ failed_inputs.txt
 runs/
 test_data_visualizations/
 wandb/
+errors/

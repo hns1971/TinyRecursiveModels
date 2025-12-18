@@ -48,6 +48,7 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
     epochs_per_iter: int  # Batch X epochs in an iteration to reduce overhead.
     rank: int
     num_replicas: int
+    start_puzzle_id: Optional[int] = None  # 可选：从指定的puzzle_id开始（仅用于评估）
 
 class PuzzleDataset(IterableDataset):
     def __init__(self, config: PuzzleDatasetConfig, split: str = "train"):
@@ -154,6 +155,12 @@ class PuzzleDataset(IterableDataset):
         # Convert dtype
         batch = {k: v.astype(np.int32) for k, v in batch.items()}
 
+        # 恢复为4行格式：inputs和labels都使用完整的4行
+        # 数据存储格式是4行×grid_width列，直接使用完整的4行
+        # - inputs: 完整的4行（题目+初始状态）
+        # - labels: 完整的4行（目标状态）
+        # 不需要提取或转换，直接使用原始数据
+
         # Convert ignore label IDs
         if self.metadata.ignore_label_id is not None:
             batch["labels"][batch["labels"] == self.metadata.ignore_label_id] = IGNORE_LABEL_ID
@@ -170,71 +177,61 @@ class PuzzleDataset(IterableDataset):
 
         # To tensor
         result = {k: torch.from_numpy(v) for k, v in batch.items()}
-        # 添加非numpy字段（保持原始类型）
-        result.update(extra_fields)
+        
+        # 处理_input_row34：转换为tensor
+        if "_input_row34" in extra_fields:
+            result["_input_row34"] = torch.from_numpy(extra_fields["_input_row34"])
+        # 添加其他非numpy字段（保持原始类型）
+        for k, v in extra_fields.items():
+            if k != "_input_row34":
+                result[k] = v
         return result
     
     def _iter_test(self):
         for set_i, (set_name, dataset) in enumerate(self._data.items()):  # type: ignore
-            # 在评估模式下，只使用每道题目的第一步数据（s₀, s₁），跳过后续步骤
-            # 参考 show_addition_training_data.py 的逻辑：
-            # 对于每个puzzle_id，找到所有具有相同puzzle_identifier的样本索引
-            # 第一个索引（最小的索引）就是第一步
+            # 在评估模式下，使用所有步骤的数据（用于单步状态转换的评估）
+            # 按顺序遍历所有样本，不随机打乱
             puzzle_identifiers = dataset["puzzle_identifiers"]
             total_samples = len(dataset["inputs"])
             
-            # 找到所有唯一的puzzle_id
-            unique_puzzle_ids = np.unique(puzzle_identifiers)
-            
-            # 对于每个puzzle_id，找到第一步的索引（最小的索引）
-            first_step_indices = []
-            puzzle_ids_list = []
-            for puzzle_id in unique_puzzle_ids:
-                # 找到所有具有相同puzzle_identifier的样本索引
-                same_puzzle_indices = np.where(puzzle_identifiers == puzzle_id)[0]
-                if len(same_puzzle_indices) > 0:
-                    # 第一个索引（最小的索引）就是第一步
-                    first_step_idx = int(np.min(same_puzzle_indices))
-                    first_step_indices.append(first_step_idx)
-                    puzzle_ids_list.append(int(puzzle_id))
-            
-            # 按索引排序，确保顺序一致
-            sorted_indices = np.argsort(first_step_indices)
-            first_step_indices = [first_step_indices[i] for i in sorted_indices]
-            puzzle_ids_list = [puzzle_ids_list[i] for i in sorted_indices]
-            
-            total_examples = len(first_step_indices)
+            # 如果指定了start_puzzle_id，只返回从该puzzle_id开始的样本
+            if self.config.start_puzzle_id is not None:
+                # 找到所有puzzle_id >= start_puzzle_id的样本索引
+                valid_mask = puzzle_identifiers >= self.config.start_puzzle_id
+                all_indices = np.where(valid_mask)[0].astype(np.int64)
+                if len(all_indices) == 0:
+                    print(f"警告: 没有找到puzzle_id >= {self.config.start_puzzle_id}的样本")
+                    continue
+                filtered_total_samples = len(all_indices)
+            else:
+                # 直接使用所有样本的索引（按顺序）
+                all_indices = np.arange(total_samples, dtype=np.int64)
+                filtered_total_samples = total_samples
             
             # Load examples one by one
             start_index = 0
-            while start_index < total_examples:
+            while start_index < filtered_total_samples:
                 # Compute indices
-                end_index = min(total_examples, start_index + self.config.global_batch_size)
+                end_index = min(filtered_total_samples, start_index + self.config.global_batch_size)
                 
                 local_start = start_index + self.config.rank * self.local_batch_size
                 local_end   = min(start_index + (self.config.rank + 1) * self.local_batch_size, end_index)
                 
-                # 获取第一步的索引
-                batch_first_step_indices = np.array(first_step_indices[local_start: local_end], dtype=np.int64)
+                # 获取当前batch的索引
+                batch_indices = all_indices[local_start: local_end]
                 
-                # 获取对应的puzzle IDs（从puzzle_ids_list中获取）
-                batch_puzzle_ids = np.array(puzzle_ids_list[local_start: local_end], dtype=np.int32)
-                
-                # puzzle_identifiers是按步骤存储的，所以应该使用first_step_idx直接索引
-                # 而不是使用puzzle_id索引
-                batch_puzzle_identifiers = dataset["puzzle_identifiers"][batch_first_step_indices]
+                # 获取对应的puzzle identifiers
+                batch_puzzle_identifiers = dataset["puzzle_identifiers"][batch_indices]
                 
                 batch = self._collate_batch({
-                    "inputs": dataset["inputs"][batch_first_step_indices],
-                    "labels": dataset["labels"][batch_first_step_indices],
+                    "inputs": dataset["inputs"][batch_indices],
+                    "labels": dataset["labels"][batch_indices],
                     "puzzle_identifiers": batch_puzzle_identifiers
                 })
                 
-                # 在测试模式下，只使用每道题目的第一步数据（s₀, s₁）
-                # 不需要保存起始索引用于加载后续步骤的label，因为后续步骤不作为评估数据
-                # 但为了兼容性，仍然保存这些字段（虽然不会被使用）
-                batch["_dataset_start_idx"] = batch_first_step_indices[0] if len(batch_first_step_indices) > 0 else 0  # 保存第一步的索引（兼容性）
-                batch["_dataset_set_name"] = set_name  # 保存set_name（兼容性）
+                # 保存索引和set_name（用于兼容性）
+                batch["_dataset_start_idx"] = batch_indices[0] if len(batch_indices) > 0 else 0
+                batch["_dataset_set_name"] = set_name
 
                 yield set_name, batch, end_index - start_index
                 

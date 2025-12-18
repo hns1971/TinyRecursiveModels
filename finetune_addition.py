@@ -71,6 +71,8 @@ def main():
                        help="总训练步数（默认：None，使用epochs计算。推荐：50000-200000）")
     parser.add_argument("--eval-interval", type=int, default=None,
                        help="评估间隔（单位：epochs，默认：自动设置）。可以与--total-steps同时使用")
+    parser.add_argument("--eval-interval-steps", type=int, default=None,
+                       help="评估间隔（单位：steps，默认：None）。如果设置，将优先于--eval-interval使用")
     parser.add_argument("--lr", type=float, default=5e-5,
                        help="学习率（默认：5e-5）")
     parser.add_argument("--puzzle-emb-lr", type=float, default=1e-3,
@@ -145,25 +147,37 @@ def main():
             # 读取global_batch_size
             if 'global_batch_size' in config_data:
                 config_defaults['global_batch_size'] = config_data['global_batch_size']
+            # 读取eval_interval_steps
+            if 'eval_interval_steps' in config_data:
+                config_defaults['eval_interval_steps'] = config_data['eval_interval_steps']
+            # 读取eval_interval
+            if 'eval_interval' in config_data:
+                config_defaults['eval_interval'] = config_data['eval_interval']
     
-    # 加载metadata以获取推理步数和数据形状
+    # 加载metadata以获取数据形状
     metadata_path = os.path.join(args.data_path, "train", "dataset.json")
     if os.path.exists(metadata_path):
         with open(metadata_path, 'r') as f:
             metadata_dict = json.load(f)
         metadata = PuzzleDatasetMetadata(**metadata_dict)
         
-        # 从metadata获取推理步数（向上取整）
-        halt_max_steps = int(np.ceil(metadata.mean_puzzle_examples))
         print(f"ℹ️  从数据源获取信息:")
-        print(f"   平均步骤数: {metadata.mean_puzzle_examples:.2f}")
-        print(f"   推理步数 (halt_max_steps): {halt_max_steps}")
-        print(f"   序列长度: {metadata.seq_len}")
+        print(f"   平均每个puzzle的状态转移数: {metadata.mean_puzzle_examples:.2f}")
+        print(f"   序列长度（单个网格大小）: {metadata.seq_len}")
         print(f"   网格宽度 (grid_width): {metadata.seq_len // 4}")
+        
+        # 新数据格式：每条数据是一个状态转移对 (s_i, s_{i+1})
+        # 模型每次推理只需要1步就能完成一个状态转移
+        # 所以 halt_max_steps 应该设置为1
+        # 注意：如果用户想要模型能够进行多步推理（从一个状态推理到最终状态），
+        # 可以手动设置 halt_max_steps 为一个更大的值（比如平均状态转移数）
+        # 但在当前的数据格式下，每条数据只需要1步推理，所以设置为1
+        halt_max_steps = 1
+        print(f"   推理步数 (halt_max_steps): {halt_max_steps} (新数据格式下，每条数据只需要1步推理)")
     else:
-        # 如果metadata不存在，使用默认值
-        halt_max_steps = 16
-        print(f"⚠️  警告：找不到metadata文件，使用默认halt_max_steps={halt_max_steps}")
+        # 如果metadata不存在，使用默认值1（新数据格式）
+        halt_max_steps = 1
+        print(f"⚠️  警告：找不到metadata文件，使用默认halt_max_steps={halt_max_steps} (新数据格式)")
     
     # 如果既没有设置epochs也没有设置total_steps，使用默认值
     if args.epochs is None and args.total_steps is None:
@@ -171,13 +185,23 @@ def main():
         args.total_steps = 100000
         print(f"ℹ️  未指定epochs或total_steps，使用默认total_steps={args.total_steps}")
     
-    # 自动设置eval_interval
+    # 自动设置eval_interval和eval_interval_steps
+    # 优先级：命令行参数 > 配置文件 > 默认值
+    # 如果命令行没有指定，尝试从配置文件读取
+    if args.eval_interval_steps is None and 'eval_interval_steps' in config_defaults:
+        args.eval_interval_steps = config_defaults['eval_interval_steps']
+    if args.eval_interval is None and 'eval_interval' in config_defaults:
+        args.eval_interval = config_defaults['eval_interval']
+    
     # 如果用户想要只在训练完成后评估，可以设置--eval-interval 0或--no-eval-during-training
-    if args.eval_interval is None:
+    if args.eval_interval_steps is not None:
+        # 如果设置了eval_interval_steps，优先使用
+        print(f"ℹ️  评估间隔: {args.eval_interval_steps} steps（将进行中间评估）")
+    elif args.eval_interval is None:
         # 默认行为：只在训练完成后评估（不进行中间评估）
         args.eval_interval = None
         print(f"ℹ️  评估模式: 只在训练完成后评估（不进行中间评估）")
-        print(f"   提示: 如果想进行中间评估，可以使用 --eval-interval <epochs>")
+        print(f"   提示: 如果想进行中间评估，可以使用 --eval-interval <epochs> 或 --eval-interval-steps <steps>")
     elif args.eval_interval == 0:
         # eval_interval=0 表示只在训练完成后评估
         args.eval_interval = None
@@ -220,12 +244,19 @@ def main():
     if args.global_batch_size is not None:
         cmd.append(f"global_batch_size={args.global_batch_size}")
     
-    # 添加eval_interval（如果指定了）
-    if args.eval_interval is not None:
+    # 添加eval_interval和eval_interval_steps（如果指定了）
+    if args.eval_interval_steps is not None:
+        # eval_interval_steps优先级更高
+        cmd.append(f"eval_interval_steps={args.eval_interval_steps}")
+        cmd.append("eval_interval=null")  # 禁用eval_interval
+        print(f"ℹ️  评估间隔: {args.eval_interval_steps} steps（将进行中间评估）")
+    elif args.eval_interval is not None:
         cmd.append(f"eval_interval={args.eval_interval}")
+        cmd.append("eval_interval_steps=null")  # 禁用eval_interval_steps
     else:
         # eval_interval=None表示只在训练完成后评估
         cmd.append("eval_interval=null")
+        cmd.append("eval_interval_steps=null")
     
     # 添加epochs或total_steps
     if args.total_steps is not None:
@@ -244,6 +275,9 @@ def main():
         cmd.append("freeze_weights=True")
     
     # 添加从数据源获取的halt_max_steps
+    # 注意：在新数据格式下，每条数据是一个状态转移对，只需要1步推理
+    # 所以 halt_max_steps 设置为1
+    # 如果用户想要模型能够进行多步推理，可以手动覆盖这个值
     if 'halt_max_steps' in locals():
         cmd.append(f"arch.halt_max_steps={halt_max_steps}")
     
@@ -259,7 +293,10 @@ def main():
         print(f"总训练步数: {args.total_steps:,}")
     if args.epochs is not None:
         print(f"训练轮数: {args.epochs}")
-    print(f"评估间隔: {args.eval_interval}")
+    if args.eval_interval_steps is not None:
+        print(f"评估间隔: {args.eval_interval_steps} steps")
+    else:
+        print(f"评估间隔: {args.eval_interval} epochs" if args.eval_interval is not None else "评估间隔: 只在训练完成后评估")
     print(f"学习率: {args.lr}")
     print(f"Puzzle embedding学习率: {args.puzzle_emb_lr}")
     if args.global_batch_size is not None:

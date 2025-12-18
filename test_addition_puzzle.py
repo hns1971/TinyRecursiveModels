@@ -30,9 +30,13 @@ from pretrain import (
     create_model,
 )
 from dataset.common import PuzzleDatasetMetadata
+from dataset.build_addition_dataset import generate_addition_puzzle
+from debug_single_forward import initialize_model, forward_once
 
-# PAD值：使用10表示PAD，以区分数字0和PAD
-PAD_VALUE = 10
+# 前导词：使用10表示前导位置和未计算位置，以区分数字0和前导/未计算位置
+LEADING_VALUE = 10
+# PAD值：使用11表示PAD，用于batch填充
+PAD_VALUE = 11
 
 
 def count_digits(n: int) -> int:
@@ -46,15 +50,15 @@ def count_digits(n: int) -> int:
     return count
 
 
-def number_to_digits(num: int, max_len: int, actual_digits: int = None, pad_to_len: int = None, use_zero_pad: bool = False) -> np.ndarray:
+def number_to_digits(num: int, max_len: int, actual_digits: int = None, pad_to_len: int = None, use_leading_pad: bool = True) -> np.ndarray:
     """将数字转换为数字数组，右对齐（个位在最右边）
     
     Args:
         num: 要转换的数字
         max_len: 最大长度（网格宽度）
         actual_digits: 数字的实际位数（不包括前导0），如果为None则自动计算
-        pad_to_len: 先用0补齐到的长度（如果为None，则直接用PAD补齐到max_len）
-        use_zero_pad: 如果True，前导位置用0补齐；如果False，用PAD_VALUE补齐
+        pad_to_len: 先用0补齐到的长度（如果为None，则直接用前导词补齐到max_len）
+        use_leading_pad: 如果True，前导位置用LEADING_VALUE补齐；如果False，用PAD_VALUE补齐
     
     Returns:
         数字数组，右对齐
@@ -76,12 +80,12 @@ def number_to_digits(num: int, max_len: int, actual_digits: int = None, pad_to_l
     if pad_to_len is not None and len(digits) < pad_to_len:
         digits = [0] * (pad_to_len - len(digits)) + digits
     
-    # 然后补齐到max_len
-    if use_zero_pad:
-        # 用0补齐
-        padded_digits = [0] * (max_len - len(digits)) + digits
+    # 然后补齐到max_len，前导位置用LEADING_VALUE或PAD_VALUE
+    if use_leading_pad:
+        # 用LEADING_VALUE补齐（前导位置）
+        padded_digits = [LEADING_VALUE] * (max_len - len(digits)) + digits
     else:
-        # 用PAD_VALUE补齐
+        # 用PAD_VALUE补齐（用于batch填充）
         padded_digits = [PAD_VALUE] * (max_len - len(digits)) + digits
     
     return np.array(padded_digits[:max_len], dtype=np.uint8)
@@ -89,7 +93,7 @@ def number_to_digits(num: int, max_len: int, actual_digits: int = None, pad_to_l
 
 def create_addition_grid(num1: int, num2: int, max_len: int = None) -> np.ndarray:
     """
-    创建加法题目的4行n列网格
+    创建加法题目的4行n列网格（与训练数据生成逻辑一致）
     
     Args:
         num1: 第一个加数
@@ -97,16 +101,16 @@ def create_addition_grid(num1: int, num2: int, max_len: int = None) -> np.ndarra
         max_len: 最大位数（如果为None，从metadata读取）
     
     Returns:
-        4行n列的网格，值范围0-9
-        - 第1行：第一个加数（右对齐，前导位置用0补齐）
-        - 第2行：第二个加数（右对齐，前导位置用0补齐）
-        - 第3行：进位数（全0，初始状态）
-        - 第4行：结果（全0，初始状态）
+        4行n列的网格
+        - 第1行：第一个加数（右对齐，前导位置用LEADING_VALUE补齐）
+        - 第2行：第二个加数（右对齐，前导位置用LEADING_VALUE补齐）
+        - 第3行：进位数（全LEADING_VALUE，初始状态，表示未计算）
+        - 第4行：结果（全LEADING_VALUE，初始状态，表示未计算）
     
     补齐规则（与训练数据生成逻辑一致）：
-        - 如果两个数位数不同，位数少的补0到与多的位数一样
-        - 如果两个数位数相同，两个都补一个0
-        - 然后用0补齐到max_len（不再使用PAD）
+        - 如果两个数位数不同，位数少的先用0补齐到与多的位数一样
+        - 为避免矛盾，两个数前面多补一个0，用于计算
+        - 前导位置用LEADING_VALUE补齐，未计算位置也用LEADING_VALUE表示
     """
     # 如果max_len为None，使用默认值11（与当前训练数据一致）
     # 注意：如果重新生成了12位的数据集，这里应该改为12
@@ -119,43 +123,261 @@ def create_addition_grid(num1: int, num2: int, max_len: int = None) -> np.ndarra
     actual_max_digits = max(digits1_count, digits2_count)
     
     # 确定补齐规则（与训练数据生成逻辑一致）：
-    # 1. 如果两个数位数不同，位数少的补0到与多的位数一样
-    # 2. 如果两个数位数相同，两个都补一个0
-    if digits1_count != digits2_count:
-        # 位数不同：位数少的补0到与多的位数一样
-        pad_to_len = actual_max_digits
-    else:
-        # 位数相同：两个都补一个0
-        pad_to_len = actual_max_digits + 1
+    # 1. 如果两个数位数不同，位数少的先用0补齐到与多的位数一样
+    # 2. 为避免矛盾，两个数前面多补一个0，用于计算
+    # 所以 pad_to_len = actual_max_digits + 1
+    pad_to_len = actual_max_digits + 1
     
     # 转换为数字数组（右对齐）
-    # 先用0补齐到pad_to_len，然后用0补齐到max_len（不再使用PAD）
-    digits1 = number_to_digits(num1, max_len, digits1_count, pad_to_len=pad_to_len, use_zero_pad=True)
-    digits2 = number_to_digits(num2, max_len, digits2_count, pad_to_len=pad_to_len, use_zero_pad=True)
+    # 先用0补齐到pad_to_len，然后用LEADING_VALUE补齐到max_len
+    digits1 = number_to_digits(num1, max_len, digits1_count, pad_to_len=pad_to_len, use_leading_pad=True)
+    digits2 = number_to_digits(num2, max_len, digits2_count, pad_to_len=pad_to_len, use_leading_pad=True)
     
-    # 创建4行网格，初始化为0
-    grid = np.zeros((4, max_len), dtype=np.uint8)
-    grid[0, :] = digits1  # 第1行：第一个加数（前导位置已经是0）
-    grid[1, :] = digits2  # 第2行：第二个加数（前导位置已经是0）
-    # 第3行和第4行保持为0（初始状态，表示未计算）
+    # 创建4行网格，初始化为LEADING_VALUE（与训练数据生成逻辑一致）
+    grid = np.full((4, max_len), LEADING_VALUE, dtype=np.uint8)
+    grid[0, :] = digits1  # 第1行：第一个加数（前导位置已经是LEADING_VALUE）
+    grid[1, :] = digits2  # 第2行：第二个加数（前导位置已经是LEADING_VALUE）
+    # 第3行和第4行保持为LEADING_VALUE（初始状态，表示未计算）
+    # 注意：在中间步骤的预测结果中，进位行（第3行）的个位位置（最右边）应该是PAD_VALUE，
+    # 因为个位没有来自右边的进位输入。但在初始状态时，第3行全为LEADING_VALUE是正确的。
     
     return grid
 
 
-def visualize_addition_grid(grid: np.ndarray, title: str = "", pad_value: int = PAD_VALUE):
-    """可视化加法网格，PAD值显示为'P'"""
+def visualize_addition_grid(grid: np.ndarray, title: str = "", pad_value: int = PAD_VALUE, leading_value: int = LEADING_VALUE):
+    """可视化加法网格，LEADING_VALUE显示为 F，PAD值显示为 P"""
     print(f"\n{title}:")
     print("-" * 60)
     
     def format_row_for_display(row):
-        """格式化行显示，将PAD值（10）显示为'P'，其他值转换为int"""
-        return [int(val) if val != pad_value else "P" for val in row]
+        """格式化行显示，将LEADING_VALUE（10）显示为 F，PAD值（11）显示为 P，其他值转换为int"""
+        result = []
+        for val in row:
+            if val == leading_value:
+                result.append("F")  # LEADING_VALUE显示为F
+            elif val == pad_value:
+                result.append("P")  # PAD_VALUE显示为P
+            else:
+                result.append(int(val))
+        return result
     
-    print(f"第1行（加数1）: {format_row_for_display(grid[0])}")
-    print(f"第2行（加数2）: {format_row_for_display(grid[1])}")
-    print(f"第3行（进位）: {format_row_for_display(grid[2])}")
-    print(f"第4行（结果）: {format_row_for_display(grid[3])}")
+    def row_to_str(row_vals):
+        return " ".join(str(x) for x in format_row_for_display(row_vals))
+    
+    print(f"第1行（加数1）: {row_to_str(grid[0])}")
+    print(f"第2行（加数2）: {row_to_str(grid[1])}")
+    print(f"第3行（进位）: {row_to_str(grid[2])}")
+    print(f"第4行（结果）: {row_to_str(grid[3])}")
     print("-" * 60)
+
+
+def extract_result_from_grid(pred_grid, row_index=3):
+    """从预测网格中提取结果数字（默认从第4行提取）"""
+    result_digits = pred_grid[row_index]
+    # 去掉前导LEADING_VALUE、PAD_VALUE和前导0
+    start_idx = 0
+    while start_idx < len(result_digits) and (result_digits[start_idx] == LEADING_VALUE or result_digits[start_idx] == PAD_VALUE or result_digits[start_idx] == 0):
+        start_idx += 1
+    if start_idx < len(result_digits):
+        # 保留有效数字（跳过LEADING_VALUE和PAD_VALUE）
+        valid_digits = [str(int(val)) for val in result_digits[start_idx:] if val != LEADING_VALUE and val != PAD_VALUE and 0 <= val <= 9]
+        if len(valid_digits) > 0:
+            try:
+                return int(''.join(valid_digits))
+            except:
+                pass
+    # 如果所有位置都被跳过，检查是否全为0（0是有效结果）
+    if start_idx >= len(result_digits):
+        # 检查是否全为0：所有值都是0或LEADING_VALUE（没有PAD_VALUE），且至少有一个0
+        has_pad = any(val == PAD_VALUE for val in result_digits)
+        if not has_pad:
+            # 没有PAD_VALUE，检查是否有0
+            has_zero = any(val == 0 for val in result_digits)
+            if has_zero:
+                return 0
+    return None
+
+
+def test_single_addition_puzzle(
+    num1: int,
+    num2: int,
+    checkpoint: str = None,
+    max_len: int = None,
+    max_steps: int = 16,
+    puzzle_id: int = None,
+    config_path: str = "config",
+    config_name: str = "cfg_finetune_addition",
+    confidence_threshold: float = 0.9,
+    verbose: bool = True,
+    # 可选：传入已初始化的模型参数（避免重复初始化）
+    base_model=None,
+    model_seq_len=None,
+    puzzle_id_value=None,
+):
+    """
+    测试单个加法题目
+    
+    Args:
+        num1: 第一个加数
+        num2: 第二个加数
+        checkpoint: Checkpoint文件路径（如果base_model已提供，则不需要）
+        max_len: 网格列数（如果为None，从metadata读取）
+        max_steps: 最大推理步数
+        puzzle_id: Puzzle identifier（None则禁用puzzle_emb）
+        config_path: 配置文件目录
+        config_name: 配置文件名
+        confidence_threshold: 置信度阈值
+        verbose: 是否打印详细信息
+        base_model: 可选的已初始化模型（如果提供，则不会重新初始化）
+        model_seq_len: 可选的模型序列长度（如果base_model已提供，需要提供此参数）
+        puzzle_id_value: 可选的puzzle_id值（如果base_model已提供，需要提供此参数）
+    
+    Returns:
+        dict: 包含以下键的字典
+            - is_correct: 是否正确
+            - predicted_result: 预测结果（整数）
+            - expected_result: 期望结果（整数）
+            - total_steps: 总步数
+            - all_predictions: 所有步骤的预测网格列表
+            - all_q_halt_logits: 所有步骤的q_halt_logits列表
+            - all_confidence_scores: 所有步骤的置信度列表
+            - final_pred_grid: 最终预测网格
+    """
+    # 初始化模型（如果未提供）
+    if base_model is None:
+        if checkpoint is None:
+            raise ValueError("必须提供checkpoint或base_model")
+        base_model, model_seq_len, puzzle_id_value, config, eval_metadata = initialize_model(
+            checkpoint=checkpoint,
+            config_path=config_path,
+            config_name=config_name,
+            puzzle_id=puzzle_id,
+        )
+    else:
+        if model_seq_len is None or puzzle_id_value is None:
+            raise ValueError("如果提供base_model，必须同时提供model_seq_len和puzzle_id_value")
+    
+    # 根据metadata确定网格列数
+    if max_len is None:
+        max_len = model_seq_len // 4  # 从metadata读取
+        if verbose:
+            print(f"从metadata读取: seq_len={model_seq_len}, 网格列数={max_len}")
+    elif verbose:
+        print(f"使用用户指定的网格列数: {max_len}")
+    
+    # 创建加法网格
+    grid = create_addition_grid(num1, num2, max_len)
+    expected_result = num1 + num2
+    
+    if verbose:
+        print("=" * 60)
+        print("加法题目测试")
+        print("=" * 60)
+        print(f"题目: {num1} + {num2} = {expected_result}")
+        print(f"网格大小: {grid.shape[0]}行 × {grid.shape[1]}列")
+        visualize_addition_grid(grid, "输入网格（初始状态）", pad_value=PAD_VALUE, leading_value=LEADING_VALUE)
+        print("=" * 60)
+        print()
+        print("=" * 60)
+        print("开始推理...")
+        print("=" * 60)
+    
+    # 推理循环
+    all_predictions = []
+    all_q_halt_logits = []
+    all_confidence_scores = []
+    
+    # 当前输入网格（开始时使用初始网格，之后使用预测结果）
+    current_grid = grid.copy()
+    
+    with torch.no_grad():
+        for step in range(max_steps):
+            if verbose:
+                print("\n" + "="*80)
+                print(f"[单测] 步骤 {step + 1} - 输入网格:")
+                print("="*80)
+                visualize_addition_grid(current_grid, f"步骤 {step + 1} 输入", pad_value=PAD_VALUE, leading_value=LEADING_VALUE)
+            
+            # 调用 forward_once
+            carry, outputs, batch, pred_grid = forward_once(
+                base_model=base_model,
+                grid=current_grid,
+                max_len=max_len,
+                model_seq_len=model_seq_len,
+                puzzle_id_value=puzzle_id_value,
+                carry=None,  # 每次都重新初始化carry，只使用预测结果（网格）作为输入
+                verbose=False,  # 不打印详细信息，我们自己打印
+            )
+            
+            # 获取 q_halt_logits
+            q_halt_logits = outputs["q_halt_logits"]
+            model_halted = carry.halted[0].item() if hasattr(carry, 'halted') else False
+            model_halt_pred = (q_halt_logits[0] >= 0).item()
+            confidence = torch.sigmoid(q_halt_logits[0]).item()
+            
+            all_predictions.append(pred_grid.copy())
+            all_q_halt_logits.append(q_halt_logits[0].item())
+            all_confidence_scores.append(confidence)
+            
+            if verbose:
+                print(f"\n步骤 {step + 1} 输出:")
+                print(f"  Q_halt logit: {q_halt_logits[0].item():.4f}")
+                print(f"  置信度 (sigmoid): {confidence:.4f}")
+                print(f"  模型 halted 标志: {model_halted}  (来自 carry.halted)")
+                print(f"  模型 halt 预测: {model_halt_pred}  (q_halt_logits >= 0)")
+                visualize_addition_grid(pred_grid, f"步骤 {step + 1} 预测", pad_value=PAD_VALUE, leading_value=LEADING_VALUE)
+            
+            # 将预测结果作为下一次的输入
+            current_grid = pred_grid.copy()
+            
+            # 提取结果并检查
+            predicted_result = extract_result_from_grid(pred_grid)
+            if predicted_result is not None and verbose:
+                status = "✓" if predicted_result == expected_result else "✗"
+                print(f"  提取的结果: {predicted_result} (期望: {expected_result}) {status}")
+    
+    # 提取最终结果
+    final_pred_grid = all_predictions[-1] if all_predictions else None
+    predicted_result = extract_result_from_grid(final_pred_grid) if final_pred_grid is not None else None
+    is_correct = (predicted_result == expected_result) if predicted_result is not None else False
+    
+    if verbose:
+        # 显示最终结果
+        print("\n" + "=" * 60)
+        print("最终结果")
+        print("=" * 60)
+        
+        if final_pred_grid is not None:
+            visualize_addition_grid(final_pred_grid, "最终预测网格", pad_value=PAD_VALUE, leading_value=LEADING_VALUE)
+            
+            if predicted_result is not None:
+                print(f"\n最终结果: {predicted_result}")
+                print(f"期望结果: {expected_result}")
+                print(f"是否正确: {'✓ 正确' if is_correct else '✗ 错误'}")
+            else:
+                print(f"\n无法解析结果")
+            
+            print(f"\n推理统计:")
+            print(f"  总步数: {len(all_predictions)}")
+            print(f"  最终Q_halt logit: {all_q_halt_logits[-1]:.4f}")
+            print(f"  最终置信度: {all_confidence_scores[-1]:.4f}")
+            
+            # 显示所有步骤的Q值和置信度变化
+            print(f"\nQ值和置信度变化:")
+            for i, (q_halt, conf) in enumerate(zip(all_q_halt_logits, all_confidence_scores)):
+                threshold_mark = "✓" if conf >= confidence_threshold else ""
+                print(f"  步骤 {i+1}: Q_halt={q_halt:7.4f}, 置信度={conf:.4f} {threshold_mark}")
+    
+    return {
+        "is_correct": is_correct,
+        "predicted_result": predicted_result,
+        "expected_result": expected_result,
+        "total_steps": len(all_predictions),
+        "all_predictions": all_predictions,
+        "all_q_halt_logits": all_q_halt_logits,
+        "all_confidence_scores": all_confidence_scores,
+        "final_pred_grid": final_pred_grid,
+    }
 
 
 def main():
@@ -205,15 +427,20 @@ def main():
     )
     parser.add_argument(
         "--puzzle-id",
-        type=str,
+        type=int,
         default=None,
-        help="Puzzle标识符（默认：自动生成）"
+        help="可选：指定 puzzle identifier；不指定则禁用 puzzle_emb（puzzle_emb_len=0）"
     )
     parser.add_argument(
         "--max-steps",
         type=int,
         default=16,
         help="最大推理步数（默认：16）"
+    )
+    parser.add_argument(
+        "--show-labels",
+        action="store_true",
+        help="调试用：显示每一步用于监督的标签网格 (s_{i+1})，方便核对是否与题目匹配"
     )
     parser.add_argument(
         "--confidence-threshold",
@@ -236,319 +463,19 @@ def main():
     
     args = parser.parse_args()
     
-    # 生成puzzle_id
-    if args.puzzle_id is None:
-        args.puzzle_id = f"addition_{args.num1}_{args.num2}"
-    
-    # 初始化分布式（单GPU）
-    RANK = 0
-    WORLD_SIZE = 1
-    
-    if not dist.is_initialized():
-        import tempfile
-        tmp_file = tempfile.mktemp()
-        try:
-            if torch.cuda.is_available():
-                dist.init_process_group(
-                    backend="nccl",
-                    init_method=f"file://{tmp_file}",
-                    rank=RANK,
-                    world_size=WORLD_SIZE,
-                )
-            else:
-                dist.init_process_group(
-                    backend="gloo",
-                    init_method=f"file://{tmp_file}",
-                    rank=RANK,
-                    world_size=WORLD_SIZE,
-                )
-        finally:
-            try:
-                if os.path.exists(tmp_file):
-                    os.remove(tmp_file)
-            except:
-                pass
-    
-    # 加载配置
-    if GlobalHydra.instance().is_initialized():
-        GlobalHydra.instance().clear()
-    
-    with initialize_config_dir(config_dir=os.path.abspath(args.config_path), version_base=None):
-        hydra_config = compose(config_name=args.config_name)
-    
-    # 设置配置 - 使用addition数据集
-    OmegaConf.set_struct(hydra_config, False)
-    hydra_config.load_checkpoint = args.checkpoint
-    hydra_config.data_paths = ["data/addition"]  # 使用addition数据集
-    OmegaConf.set_struct(hydra_config, True)
-    
-    config = load_synced_config(hydra_config, rank=RANK, world_size=WORLD_SIZE)
-    
-    # 加载metadata（先加载metadata以确定正确的网格大小）
-    metadata_path = os.path.join(config.data_paths[0], "train", "dataset.json")
-    if not os.path.exists(metadata_path):
-        raise FileNotFoundError(f"找不到metadata文件: {metadata_path}")
-    
-    with open(metadata_path, 'r') as f:
-        metadata_dict = json.load(f)
-    eval_metadata = PuzzleDatasetMetadata(**metadata_dict)
-    
-    # 根据metadata确定网格列数
-    if args.max_len is None:
-        args.max_len = eval_metadata.seq_len // 4  # 从metadata读取
-        print(f"从metadata读取: seq_len={eval_metadata.seq_len}, 网格列数={args.max_len}")
-    
-    # 创建加法网格（使用正确的列数）
-    grid = create_addition_grid(args.num1, args.num2, args.max_len)
-    
-    # 显示输入信息
-    print("=" * 60)
-    print("加法题目测试")
-    print("=" * 60)
-    print(f"题目: {args.num1} + {args.num2} = {args.num1 + args.num2}")
-    print(f"网格大小: {grid.shape[0]}行 × {grid.shape[1]}列")
-    visualize_addition_grid(grid, "输入网格（初始状态）")
-    print("=" * 60)
-    print()
-    
-    # 创建模型
-    model, optimizers, optimizer_lrs = create_model(config, eval_metadata, rank=RANK, world_size=WORLD_SIZE)
-    model.eval()
-    
-    # 获取底层模型
-    base_model = model.model if hasattr(model, 'model') else model
-    
-    # 处理输入：将4行n列的网格转换为序列格式
-    # 加法数据集格式：值+1（数字0-9变成1-10），然后展平
-    input_grid = grid.copy()
-    
-    # 展平为一维序列（值+1：数字0-9变成1-10）
-    input_seq = (input_grid.flatten() + 1).astype(np.int32)
-    
-    # 填充到seq_len（如果长度不足，右填充0+1=1）
-    seq_len = eval_metadata.seq_len
-    if len(input_seq) < seq_len:
-        # 右填充0+1=1（因为现在不再使用PAD_VALUE）
-        input_seq = np.pad(input_seq, (0, seq_len - len(input_seq)), constant_values=1)
-    elif len(input_seq) > seq_len:
-        input_seq = input_seq[:seq_len]
-    
-    # 创建batch
-    batch = {
-        "inputs": torch.tensor(input_seq, dtype=torch.int32).unsqueeze(0).cuda(),
-        "labels": torch.full((1, len(input_seq)), -100, dtype=torch.long).cuda(),
-        "puzzle_identifiers": torch.zeros(1, dtype=torch.int32).cuda(),
-    }
-    
-    print("=" * 60)
-    print("开始推理...")
-    print("=" * 60)
-    print(f"注意: 训练数据seq_len={eval_metadata.seq_len}, 测试输入seq_len={len(input_seq)}")
-    if len(input_seq) != eval_metadata.seq_len:
-        print(f"⚠️  警告: 序列长度不匹配！这可能导致推理错误。")
-    print("=" * 60)
-    
-    # 初始化carry
-    with torch.device("cuda"):
-        carry = base_model.initial_carry(batch)
-        # 重要：初始化时halted=True，需要先设置为False才能开始推理
-        carry.halted = torch.zeros_like(carry.halted)
-        # 关键：初始化carry.current_data为batch的值（而不是empty_like的未初始化值）
-        # 这样第一次迭代时，如果halted=False，会使用正确的初始输入
-        carry.current_data = {k: v.clone() for k, v in batch.items()}
-        
-        # 关键修复：在第一步时，即使halted=False，也要重置inner_carry，避免使用未初始化的值
-        # 因为empty_carry创建的是未初始化的tensor，可能包含NaN
-        # 在第一步时，所有序列都应该使用初始化的carry值
-        if hasattr(base_model, 'inner') and hasattr(base_model.inner, 'reset_carry'):
-            # 在第一步时，强制重置所有序列的carry
-            reset_all = torch.ones_like(carry.halted, dtype=torch.bool)
-            carry.inner_carry = base_model.inner.reset_carry(reset_all, carry.inner_carry)
-    
-    # 推理循环
-    all_predictions = []
-    all_q_halt_logits = []
-    all_confidence_scores = []
-    
-    puzzle_emb_len = base_model.inner.puzzle_emb_len if hasattr(base_model.inner, 'puzzle_emb_len') else 16
-    
-    import torch.nn.functional as F
-    
-    with torch.no_grad():
-        for step in range(args.max_steps):
-            carry, outputs = base_model(carry=carry, batch=batch)
-            
-            # 在评估模式下，模型不会自动根据halt信号停止，需要手动检查
-            # 检查halt信号：如果q_halt_logits > 0（对于no_ACT_continue）或满足其他halt条件
-            if not base_model.training:
-                # 从config获取halt配置
-                no_ACT_continue = getattr(config.arch, 'no_ACT_continue', True)
-                halt_max_steps = getattr(config.arch, 'halt_max_steps', 16)
-                
-                # 检查是否达到最大步数
-                is_last_step = carry.steps >= halt_max_steps
-                
-                # 根据halt信号决定是否停止
-                q_halt_logits = outputs["q_halt_logits"]
-                
-                # 检查q_halt_logits是否有NaN
-                has_nan = torch.isnan(q_halt_logits).any()
-                if has_nan:
-                    # 如果有NaN，将NaN位置设置为False（不halt），避免传播
-                    q_halt_logits = torch.where(torch.isnan(q_halt_logits), torch.zeros_like(q_halt_logits), q_halt_logits)
-                
-                if no_ACT_continue:
-                    # 如果q_halt_logits > 0，则halt
-                    halt_signal = q_halt_logits > 0
-                else:
-                    # 如果q_halt_logits > q_continue_logits，则halt
-                    q_continue_logits = outputs.get("q_continue_logits", torch.zeros_like(q_halt_logits))
-                    # 检查q_continue_logits是否有NaN
-                    if torch.isnan(q_continue_logits).any():
-                        q_continue_logits = torch.where(torch.isnan(q_continue_logits), torch.zeros_like(q_continue_logits), q_continue_logits)
-                    halt_signal = q_halt_logits > q_continue_logits
-                
-                # 确保halt_signal的形状与carry.halted匹配
-                if halt_signal.ndim > carry.halted.ndim:
-                    halt_signal = halt_signal.squeeze(-1)
-                elif halt_signal.ndim < carry.halted.ndim:
-                    halt_signal = halt_signal.unsqueeze(-1)
-                
-                # 确保halt_signal和is_last_step的形状匹配
-                if halt_signal.shape != carry.halted.shape:
-                    if halt_signal.numel() == 1:
-                        halt_signal = halt_signal.expand_as(carry.halted)
-                    elif carry.halted.numel() == 1:
-                        carry.halted = carry.halted.expand_as(halt_signal)
-                
-                # 更新halted状态：达到最大步数或halt信号为True
-                carry.halted = is_last_step | halt_signal
-            
-            # 获取q_halt_logits用于后续显示（在评估模式已在上面获取，但这里统一获取以确保可用）
-            q_halt_logits = outputs["q_halt_logits"]
-            
-            logits = outputs["logits"]
-            preds = logits.argmax(dim=-1)
-            
-            # 计算置信度：sigmoid(q_halt_logits)
-            confidence = torch.sigmoid(q_halt_logits[0]).item()
-            
-            pred_seq = preds[0].cpu().numpy()
-            
-            # 转换为网格（减去1，因为训练时值+1）
-            # 数字1-10变成0-9，PAD(11)变成10
-            pred_seq = pred_seq - 1
-            # 不要clip，保留PAD值（10）
-            # pred_seq = np.clip(pred_seq, 0, 9)  # 移除clip，保留PAD值（10）
-            
-            # 重塑为4行n列（使用训练数据的实际列数）
-            num_cols = eval_metadata.seq_len // 4
-            expected_size = 4 * num_cols
-            if len(pred_seq) >= expected_size:
-                pred_grid = pred_seq[:expected_size].reshape(4, num_cols)
-            else:
-                # 如果长度不足，填充0
-                padded = np.pad(pred_seq, (0, expected_size - len(pred_seq)), constant_values=0)
-                pred_grid = padded.reshape(4, num_cols)
-            
-            all_predictions.append(pred_grid.copy())
-            all_q_halt_logits.append(q_halt_logits[0].item())
-            all_confidence_scores.append(confidence)
-            
-            print(f"\n步骤 {step + 1}:")
-            print(f"  Q_halt logit: {q_halt_logits[0].item():.4f}")
-            print(f"  置信度 (sigmoid): {confidence:.4f}")
-            print(f"  Halted: {carry.halted[0].item()}")
-            visualize_addition_grid(pred_grid, f"步骤 {step + 1} 预测")
-            
-            # 提取结果（第4行）
-            result_digits = pred_grid[3]
-            # 去掉前导0
-            start_idx = 0
-            while start_idx < len(result_digits) and result_digits[start_idx] == 0:
-                start_idx += 1
-            if start_idx < len(result_digits):
-                # 保留有效数字（现在没有PAD值了，都是0-9）
-                valid_digits = result_digits[start_idx:]
-                if len(valid_digits) > 0:
-                    result_str = ''.join(map(str, valid_digits))
-                    try:
-                        result = int(result_str)
-                        expected = args.num1 + args.num2
-                        status = "✓" if result == expected else "✗"
-                        print(f"  提取的结果: {result} (期望: {expected}) {status}")
-                    except:
-                        pass
-            
-            # 检查是否应该停止：置信度足够高或模型halted
-            if carry.halted.all():
-                print(f"\n模型在第 {step + 1} 步halt")
-                break
-            
-            # 关键修复：更新carry.current_data为当前预测结果，用于下一步的递归推理
-            # 在递归推理中，每一步的输入应该是上一步的输出
-            # 模型在第256行使用：new_current_data = {k: torch.where(..., batch[k], v) for k, v in carry.current_data.items()}
-            # 如果序列halted，使用batch[k]；如果未halted，使用carry.current_data中的值v
-            # 所以我们需要将预测结果更新到carry.current_data中，这样下一步才能使用上一步的输出
-            if step < args.max_steps - 1:
-                # 将预测结果转换回模型输入格式（值+1：数字0-9变成1-10）
-                next_input_seq = (pred_grid.flatten() + 1).astype(np.int32)
-                if len(next_input_seq) < eval_metadata.seq_len:
-                    # 右填充0+1=1（因为现在不再使用PAD_VALUE）
-                    next_input_seq = np.pad(next_input_seq, (0, eval_metadata.seq_len - len(next_input_seq)), constant_values=1)
-                elif len(next_input_seq) > eval_metadata.seq_len:
-                    next_input_seq = next_input_seq[:eval_metadata.seq_len]
-                
-                # 更新carry.current_data（这是关键！）
-                # 模型在下一步会使用carry.current_data作为输入（如果序列未halted）
-                next_input_tensor = torch.tensor(next_input_seq, dtype=torch.int32).unsqueeze(0).cuda()
-                carry.current_data["inputs"] = next_input_tensor.clone()  # 使用clone确保是新的tensor
-                # 同时更新batch，确保一致性（虽然模型优先使用carry.current_data）
-                batch["inputs"] = next_input_tensor.clone()
-    
-    # 显示最终结果
-    print("\n" + "=" * 60)
-    print("最终结果")
-    print("=" * 60)
-    
-    if all_predictions:
-        final_pred = all_predictions[-1]
-        visualize_addition_grid(final_pred, "最终预测网格")
-        
-        # 提取最终结果
-        result_digits = final_pred[3]
-        # 去掉前导0
-        start_idx = 0
-        while start_idx < len(result_digits) and result_digits[start_idx] == 0:
-            start_idx += 1
-        if start_idx < len(result_digits):
-            # 保留有效数字（现在没有PAD值了，都是0-9）
-            valid_digits = result_digits[start_idx:]
-            if len(valid_digits) > 0:
-                result_str = ''.join(map(str, valid_digits))
-                try:
-                    result = int(result_str)
-                    expected = args.num1 + args.num2
-                    print(f"\n最终结果: {result}")
-                    print(f"期望结果: {expected}")
-                    print(f"是否正确: {'✓ 正确' if result == expected else '✗ 错误'}")
-                except:
-                    print(f"\n无法解析结果: {result_digits}")
-            else:
-                print(f"\n无法解析结果: 没有有效数字")
-        else:
-            print(f"\n无法解析结果: 结果全为0")
-        
-        print(f"\n推理统计:")
-        print(f"  总步数: {len(all_predictions)}")
-        print(f"  最终Q_halt logit: {all_q_halt_logits[-1]:.4f}")
-        print(f"  最终置信度: {all_confidence_scores[-1]:.4f}")
-        
-        # 显示所有步骤的Q值和置信度变化
-        print(f"\nQ值和置信度变化:")
-        for i, (q_halt, confidence) in enumerate(zip(all_q_halt_logits, all_confidence_scores)):
-            threshold_mark = "✓" if confidence >= args.confidence_threshold else ""
-            print(f"  步骤 {i+1}: Q_halt={q_halt:7.4f}, 置信度={confidence:.4f} {threshold_mark}")
+    # 调用测试函数
+    result = test_single_addition_puzzle(
+        num1=args.num1,
+        num2=args.num2,
+        checkpoint=args.checkpoint,
+        max_len=args.max_len,
+        max_steps=args.max_steps,
+        puzzle_id=args.puzzle_id,
+        config_path=args.config_path,
+        config_name=args.config_name,
+        confidence_threshold=args.confidence_threshold,
+        verbose=True,
+    )
     
     # 清理
     if dist.is_initialized():

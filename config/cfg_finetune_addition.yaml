@@ -15,12 +15,16 @@ hydra:
 evaluators: []
 
 # Hyperparams - Training
-global_batch_size: 8  # 微调时可以使用较小的batch size
+global_batch_size: 64  # 微调时可以使用较小的batch size
 
 epochs: 10000
-eval_interval: None
-max_eval_batches: 2
+eval_interval: 1000
+min_eval_interval: 2000
+eval_interval_steps: 1000
+max_eval_batches: null
 checkpoint_every_eval: True
+early_stopping_patience: 4  # Stop training if metric doesn't improve for 4 evaluations
+early_stopping_metric: exact_accuracy  # Metric to monitor for early stopping
 
 # 微调学习率（通常比预训练小）
 lr: 5e-5
@@ -37,7 +41,6 @@ puzzle_emb_weight_decay: 0.1
 puzzle_emb_lr: 1e-3  # 微调时puzzle embedding学习率也可以调小
 
 seed: 0
-min_eval_interval: 0
 
 # EMA设置（微调时建议启用）
 ema: True
@@ -54,6 +57,8 @@ train_only_q_head: False
 # 第二阶段：重点训练halt_loss (lm_loss_weight=1.0, q_halt_loss_weight=1.0或更大)
 arch:
   loss:
-    lm_loss_weight: 1.0      # lm_loss的权重，默认1.0
-    q_halt_loss_weight: 0.5  # q_halt_loss的权重，默认0.5
+    lm_loss_weight: 1      # lm_loss的权重，默认1.0
+    q_halt_loss_weight: 0.01  # q_halt_loss的权重，默认0.5
+  # 训练时是否强制跑满所有推理轮次（忽略early halt信号）
+  force_max_steps_during_training: True  # 设置为True时，训练时所有数据都跑满halt_max_steps轮次
 
