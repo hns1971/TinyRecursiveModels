@@ -31,7 +31,8 @@ from pretrain import (
 )
 from dataset.common import PuzzleDatasetMetadata
 from dataset.build_addition_dataset import generate_addition_puzzle
-from debug_single_forward import initialize_model, forward_once
+from debug_single_forward import forward_once
+from inference import create_model_from_checkpoint
 
 # 前导词：使用10表示前导位置和未计算位置，以区分数字0和前导/未计算位置
 LEADING_VALUE = 10
@@ -209,6 +210,7 @@ def test_single_addition_puzzle(
     config_name: str = "cfg_finetune_addition",
     confidence_threshold: float = 0.9,
     verbose: bool = True,
+    stop_on_halt: bool = False,
     # 可选：传入已初始化的模型参数（避免重复初始化）
     base_model=None,
     model_seq_len=None,
@@ -228,6 +230,7 @@ def test_single_addition_puzzle(
         config_name: 配置文件名
         confidence_threshold: 置信度阈值
         verbose: 是否打印详细信息
+        stop_on_halt: 是否在模型预测停止时提前退出（True：按模型预测停止，False：跑满max_steps）
         base_model: 可选的已初始化模型（如果提供，则不会重新初始化）
         model_seq_len: 可选的模型序列长度（如果base_model已提供，需要提供此参数）
         puzzle_id_value: 可选的puzzle_id值（如果base_model已提供，需要提供此参数）
@@ -247,12 +250,18 @@ def test_single_addition_puzzle(
     if base_model is None:
         if checkpoint is None:
             raise ValueError("必须提供checkpoint或base_model")
-        base_model, model_seq_len, puzzle_id_value, config, eval_metadata = initialize_model(
-            checkpoint=checkpoint,
+        # 使用新的模型初始化方式
+        base_model, config, eval_metadata = create_model_from_checkpoint(
+            checkpoint_path=checkpoint,
+            data_paths=["data/addition"],  # 默认数据路径
             config_path=config_path,
             config_name=config_name,
-            puzzle_id=puzzle_id,
+            rank=0,
+            world_size=1,
+            auto_detect_task=True,
         )
+        model_seq_len = eval_metadata.seq_len
+        puzzle_id_value = puzzle_id if puzzle_id is not None else 0
     else:
         if model_seq_len is None or puzzle_id_value is None:
             raise ValueError("如果提供base_model，必须同时提供model_seq_len和puzzle_id_value")
@@ -299,8 +308,8 @@ def test_single_addition_puzzle(
                 visualize_addition_grid(current_grid, f"步骤 {step + 1} 输入", pad_value=PAD_VALUE, leading_value=LEADING_VALUE)
             
             # 调用 forward_once
-            carry, outputs, batch, pred_grid = forward_once(
-                base_model=base_model,
+            carry, metrics, extracted_metrics, batch, pred_grid = forward_once(
+                model=base_model,
                 grid=current_grid,
                 max_len=max_len,
                 model_seq_len=model_seq_len,
@@ -309,19 +318,34 @@ def test_single_addition_puzzle(
                 verbose=False,  # 不打印详细信息，我们自己打印
             )
             
-            # 获取 q_halt_logits
-            q_halt_logits = outputs["q_halt_logits"]
-            model_halted = carry.halted[0].item() if hasattr(carry, 'halted') else False
-            model_halt_pred = (q_halt_logits[0] >= 0).item()
-            confidence = torch.sigmoid(q_halt_logits[0]).item()
+            # 获取 q_halt_logits（从metrics中获取）
+            if "q_halt_logits" in metrics:
+                q_halt_logits = metrics["q_halt_logits"]
+                model_halted = carry.halted[0].item() if hasattr(carry, 'halted') else False
+                model_halt_pred = (q_halt_logits[0] >= 0).item()
+                confidence = torch.sigmoid(q_halt_logits[0]).item()
+            else:
+                # 如果没有q_halt_logits，使用默认值
+                q_halt_logits = None
+                model_halted = carry.halted[0].item() if hasattr(carry, 'halted') else False
+                model_halt_pred = False
+                confidence = 0.0
+                if verbose:
+                    print(f"警告：步骤 {step + 1} 的 metrics 中没有 q_halt_logits")
             
             all_predictions.append(pred_grid.copy())
-            all_q_halt_logits.append(q_halt_logits[0].item())
+            if q_halt_logits is not None:
+                all_q_halt_logits.append(q_halt_logits[0].item())
+            else:
+                all_q_halt_logits.append(0.0)  # 默认值
             all_confidence_scores.append(confidence)
             
             if verbose:
                 print(f"\n步骤 {step + 1} 输出:")
-                print(f"  Q_halt logit: {q_halt_logits[0].item():.4f}")
+                if q_halt_logits is not None:
+                    print(f"  Q_halt logit: {q_halt_logits[0].item():.4f}")
+                else:
+                    print(f"  Q_halt logit: N/A")
                 print(f"  置信度 (sigmoid): {confidence:.4f}")
                 print(f"  模型 halted 标志: {model_halted}  (来自 carry.halted)")
                 print(f"  模型 halt 预测: {model_halt_pred}  (q_halt_logits >= 0)")
@@ -335,6 +359,27 @@ def test_single_addition_puzzle(
             if predicted_result is not None and verbose:
                 status = "✓" if predicted_result == expected_result else "✗"
                 print(f"  提取的结果: {predicted_result} (期望: {expected_result}) {status}")
+            
+            # 如果启用了按模型预测停止，检查是否应该提前退出
+            if stop_on_halt:
+                # 检查模型是否预测停止（使用置信度阈值或halt预测）
+                should_stop = False
+                if q_halt_logits is not None:
+                    # 如果置信度超过阈值，或者模型明确预测停止
+                    if confidence >= confidence_threshold or model_halt_pred:
+                        should_stop = True
+                        if verbose:
+                            print(f"\n[停止] 模型预测停止（置信度: {confidence:.4f}, halt预测: {model_halt_pred}）")
+                elif model_halted:
+                    # 如果carry中的halted标志为True，也停止
+                    should_stop = True
+                    if verbose:
+                        print(f"\n[停止] 模型halted标志为True")
+                
+                if should_stop:
+                    if verbose:
+                        print(f"提前停止推理（步数: {step + 1}/{max_steps}）")
+                    break
     
     # 提取最终结果
     final_pred_grid = all_predictions[-1] if all_predictions else None
@@ -449,6 +494,11 @@ def main():
         help="置信度阈值（sigmoid(q_halt_logits)），超过此值则停止推理（默认：0.9）"
     )
     parser.add_argument(
+        "--stop-on-halt",
+        action="store_true",
+        help="是否在模型预测停止时提前退出（默认：False，跑满max_steps）"
+    )
+    parser.add_argument(
         "--config-path",
         type=str,
         default="config",
@@ -475,6 +525,7 @@ def main():
         config_name=args.config_name,
         confidence_threshold=args.confidence_threshold,
         verbose=True,
+        stop_on_halt=args.stop_on_halt,
     )
     
     # 清理

@@ -181,6 +181,35 @@ class ACTLossHead(nn.Module):
         if original_labels is None:
             # 如果原始batch中没有labels，尝试从batch_for_base获取
             original_labels = model_kwargs_for_base.get("batch", {}).get("labels")
+        
+        # 判断是否为推理阶段：如果labels为空/None，说明是推理阶段
+        is_inference = original_labels is None
+        
+        if is_inference:
+            # 推理阶段：不计算loss和metrics，但需要输出preds供调用者使用
+            # 创建空的metrics和loss，但包含preds和logits
+            device = outputs["logits"].device
+            dtype = outputs["logits"].dtype
+            # 计算preds（从logits获取）
+            preds = torch.argmax(outputs["logits"], dim=-1)
+            empty_metrics = {
+                "count": torch.tensor(0, dtype=torch.long, device=device),
+                "accuracy": torch.tensor(0.0, dtype=dtype, device=device),
+                "exact_accuracy": torch.tensor(0, dtype=torch.long, device=device),
+                "q_halt_accuracy": torch.tensor(0, dtype=torch.long, device=device),
+                "steps": torch.tensor(0, dtype=torch.long, device=device),
+                "lm_loss": torch.tensor(0.0, dtype=dtype, device=device),
+                "q_halt_loss": torch.tensor(0.0, dtype=dtype, device=device),
+                "preds": preds.detach(),  # 推理结果，供调用者使用
+                "logits": outputs["logits"].detach(),  # logits，供调用者使用
+            }
+            # 如果有q_halt_logits，也添加到metrics中
+            if "q_halt_logits" in outputs:
+                empty_metrics["q_halt_logits"] = outputs["q_halt_logits"].detach()
+            total_loss = torch.tensor(0.0, dtype=dtype, device=device)
+            detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
+            return new_carry, total_loss, empty_metrics, detached_outputs, new_carry.halted.all()
+        
         if original_labels is not None:
             labels = original_labels  # 使用原始batch中的labels
         else:
@@ -409,6 +438,37 @@ class AdditionACTLossHead(ACTLossHead):
                             else:
                                 print(f"  {k}[0]: {first_sample.cpu().numpy()}")
             print("="*80 + "\n")
+        
+        # 判断是否为推理阶段：如果labels为空/None，说明是推理阶段
+        # 在获取inputs之前判断，避免后续不必要的计算
+        is_inference = "labels" not in batch or batch.get("labels") is None
+        
+        if is_inference:
+            # 推理阶段：不计算loss和metrics，但需要输出preds供调用者使用
+            # 创建空的metrics和loss，但包含preds和logits
+            device = outputs["logits"].device
+            dtype = outputs["logits"].dtype
+            # 计算preds（从logits获取）
+            preds = torch.argmax(outputs["logits"], dim=-1)
+            empty_metrics = {
+                "count": torch.tensor(0, dtype=torch.long, device=device),
+                "accuracy": torch.tensor(0.0, dtype=dtype, device=device),
+                "exact_accuracy": torch.tensor(0, dtype=torch.long, device=device),
+                "q_halt_accuracy": torch.tensor(0, dtype=torch.long, device=device),
+                "steps": torch.tensor(0, dtype=torch.long, device=device),
+                "lm_loss": torch.tensor(0.0, dtype=dtype, device=device),
+                "copy_loss": torch.tensor(0.0, dtype=dtype, device=device),
+                "q_halt_loss": torch.tensor(0.0, dtype=dtype, device=device),
+                "total_loss": torch.tensor(0.0, dtype=dtype, device=device),
+                "preds": preds.detach(),  # 推理结果，供调用者使用
+                "logits": outputs["logits"].detach(),  # logits，供调用者使用
+            }
+            # 如果有q_halt_logits，也添加到metrics中
+            if "q_halt_logits" in outputs:
+                empty_metrics["q_halt_logits"] = outputs["q_halt_logits"].detach()
+            total_loss = torch.tensor(0.0, dtype=dtype, device=device)
+            detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
+            return new_carry, total_loss, empty_metrics, detached_outputs, new_carry.halted.all()
         
         # 关键修复：使用原始batch中的labels，而不是new_carry.current_data["labels"]
         # 因为new_carry.current_data["labels"]可能已经被模型更新为预测结果

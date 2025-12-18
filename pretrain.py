@@ -776,7 +776,7 @@ def evaluate_single_batch(
             print(f"[评估] 已启用调试输出，将在调用底层模型前打印详细信息")
     
     with torch.inference_mode():
-        carry, loss, metrics, _, _ = model(carry=carry, batch=batch_with_step, return_keys=[])
+        carry, loss, metrics, detached_outputs, _ = model(carry=carry, batch=batch_with_step, return_keys=[])
     
     # 关闭调试输出
     if enable_debug and hasattr(model, '_debug_eval'):
@@ -791,7 +791,19 @@ def evaluate_single_batch(
     if 'count' in metrics:
         extracted_metrics['count'] = metrics.get('count', torch.tensor(1.0)).item()
     
-    return carry, metrics, extracted_metrics
+    # 合并 metrics 和 detached_outputs，以便访问 logits, preds 等
+    # 注意：detached_outputs 可能包含 return_keys 中指定的键
+    # 但我们需要从模型内部获取 logits 和 preds
+    # 如果 metrics 中没有，尝试从 carry 或模型状态中获取
+    full_metrics = metrics.copy()
+    if detached_outputs:
+        full_metrics.update(detached_outputs)
+    
+    # 如果 metrics 中有 preds，添加到 full_metrics
+    if 'preds' in metrics:
+        full_metrics['preds'] = metrics['preds']
+    
+    return carry, full_metrics, extracted_metrics
 
 
 def evaluate(

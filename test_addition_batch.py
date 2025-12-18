@@ -23,7 +23,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dataset.build_addition_dataset import generate_random_addition
-from debug_single_forward import initialize_model
+from inference import create_model_from_checkpoint
 from test_addition_puzzle import test_single_addition_puzzle
 
 
@@ -111,6 +111,11 @@ def main():
         default=None,
         help="错误题目输出文件路径（默认：不保存）"
     )
+    parser.add_argument(
+        "--stop-on-halt",
+        action="store_true",
+        help="是否在模型预测停止时提前退出（默认：False，跑满max_steps）"
+    )
     
     args = parser.parse_args()
     
@@ -122,13 +127,18 @@ def main():
     if args.max_digits is None:
         args.max_digits = args.max_len - 1
     
-    # 使用 debug_single_forward 的初始化函数
-    base_model, model_seq_len, puzzle_id_value, config, eval_metadata = initialize_model(
-        checkpoint=args.checkpoint,
+    # 使用新的模型初始化方式（与 debug_single_forward 一致）
+    base_model, config, eval_metadata = create_model_from_checkpoint(
+        checkpoint_path=args.checkpoint,
+        data_paths=["data/addition"],  # 默认数据路径
         config_path=args.config_path,
         config_name=args.config_name,
-        puzzle_id=args.puzzle_id,
+        rank=0,
+        world_size=1,
+        auto_detect_task=True,
     )
+    model_seq_len = eval_metadata.seq_len
+    puzzle_id_value = args.puzzle_id if args.puzzle_id is not None else 0
     
     print("=" * 80)
     print("批量测试加法题目")
@@ -164,6 +174,7 @@ def main():
             config_path=args.config_path,
             config_name=args.config_name,
             verbose=False,  # 批量测试时不打印详细信息
+            stop_on_halt=args.stop_on_halt,
             base_model=base_model,  # 使用已初始化的模型
             model_seq_len=model_seq_len,
             puzzle_id_value=puzzle_id_value,
