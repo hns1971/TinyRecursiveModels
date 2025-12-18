@@ -106,14 +106,10 @@ class ARC:
     
     def result(self, save_path: Optional[str], rank: int, world_size: int, group: Optional[torch.distributed.ProcessGroup] = None) -> Optional[Dict[str, float]]:
         # Gather predictions to rank 0 for voting
-        if world_size > 1:
-            global_hmap_preds = [None for _ in range(world_size)] if rank == 0 else None
-            dist.gather_object((self._local_hmap, self._local_preds), global_hmap_preds, dst=0, group=group)
-        else:
-            # Single GPU: use local predictions directly
-            global_hmap_preds = [(self._local_hmap, self._local_preds)]
+        global_hmap_preds = [None for _ in range(world_size)] if rank == 0 else None
+        dist.gather_object((self._local_hmap, self._local_preds), global_hmap_preds, dst=0, group=group)
         
-        # Rank 0 logic (or single GPU)
+        # Rank 0 logic
         if rank != 0:
             return
 
@@ -129,10 +125,7 @@ class ARC:
                 label_hash = grid_hash(arc_grid_to_np(pair["output"]))
                 
                 p_map = {}
-                # Process predictions from all ranks (or single GPU)
-                for hmap, preds in global_hmap_preds:
-                    if hmap is None or preds is None:
-                        continue
+                for hmap, preds in global_hmap_preds:  # type: ignore
                     for h, q in preds.get(name, {}).get(input_hash, {}):
                         p_map.setdefault(h, [0, 0])
                         p_map[h][0] += 1
