@@ -1,0 +1,63 @@
+# 象棋数据集微调配置
+
+defaults:
+  - arch: trm
+  - _self_
+
+hydra:
+  output_subdir: null
+
+# 数据路径（需要在运行时指定）
+# data_paths: ['data/chess']
+# data_paths_test: ['data/chess']
+
+# 评估器（象棋任务可以后续添加特殊评估器）
+evaluators: []
+
+# Hyperparams - Training
+global_batch_size: 64  # 微调时可以使用较小的batch size
+
+epochs: 10000
+eval_interval: 1000
+min_eval_interval: 2000
+eval_interval_steps: 1000
+max_eval_batches: null
+checkpoint_every_eval: True
+early_stopping_patience: 4  # Stop training if metric doesn't improve for 4 evaluations
+early_stopping_metric: exact_accuracy  # Metric to monitor for early stopping
+
+# 微调学习率（通常比预训练小）
+lr: 5e-5
+lr_min_ratio: 1.0
+lr_warmup_steps: 500  # 微调时warmup步数可以更少
+
+# Standard hyperparameter settings
+beta1: 0.9
+beta2: 0.95
+weight_decay: 0.1
+puzzle_emb_weight_decay: 0.1
+
+# Hyperparams - Puzzle embeddings training
+puzzle_emb_lr: 1e-3  # 微调时puzzle embedding学习率也可以调小
+
+seed: 0
+
+# EMA设置（微调时建议启用）
+ema: True
+ema_rate: 0.999
+
+# 是否冻结权重（只训练puzzle embeddings）
+freeze_weights: False
+
+# 是否只训练halt头（冻结主体模型，只训练q_head）
+train_only_q_head: False
+
+# 损失权重配置（用于分阶段训练）
+# 第一阶段：只训练lm_loss (lm_loss_weight=1.0, q_halt_loss_weight=0.0)
+# 第二阶段：重点训练halt_loss (lm_loss_weight=1.0, q_halt_loss_weight=1.0或更大)
+arch:
+  loss:
+    lm_loss_weight: 1      # lm_loss的权重，默认1.0
+    q_halt_loss_weight: 0.01  # q_halt_loss的权重，默认0.5
+  # 训练时是否强制跑满所有推理轮次（忽略early halt信号）
+  force_max_steps_during_training: True  # 设置为True时，训练时所有数据都跑满halt_max_steps轮次
