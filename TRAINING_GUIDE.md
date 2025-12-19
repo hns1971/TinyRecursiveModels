@@ -32,12 +32,14 @@ python -m dataset.build_arc_dataset \
 ```bash
 python pretrain.py \
   arch=trm \
+  arch.puzzle_emb_ndim=512 \
   data_paths="[data/arc1concept-aug-1000]" \
   arch.L_layers=2 \
   arch.H_cycles=3 \
   arch.L_cycles=4 \
   +run_name=my_training_run \
-  ema=True
+  ema=True \
+  global_batch_size=64 > logs/pretrain.log 2>&1 &
 ```
 
 ### 多 GPU 分布式训练（推荐）

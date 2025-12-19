@@ -54,7 +54,17 @@ pip install -r requirements.txt
 
 echo ""
 echo "安装 adam-atan2..."
-pip install --no-cache-dir --no-build-isolation adam-atan2
+# adam-atan2 requires building CUDA extensions, so we need to install from source
+ORIGINAL_DIR=$(pwd)
+TEMP_DIR=$(mktemp -d)
+cd "$TEMP_DIR"
+pip download --no-deps adam-atan2
+tar -xzf adam_atan2-*.tar.gz
+cd adam_atan2-*
+python setup.py build_ext --inplace
+python setup.py install
+cd "$ORIGINAL_DIR"
+rm -rf "$TEMP_DIR"
 
 echo ""
 echo "=========================================="

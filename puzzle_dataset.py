@@ -48,6 +48,7 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
     epochs_per_iter: int  # Batch X epochs in an iteration to reduce overhead.
     rank: int
     num_replicas: int
+    start_puzzle_id: Optional[int] = None  # 可选：从指定的puzzle_id开始（仅用于评估）
 
 class PuzzleDataset(IterableDataset):
     def __init__(self, config: PuzzleDatasetConfig, split: str = "train"):
@@ -145,8 +146,20 @@ class PuzzleDataset(IterableDataset):
 
 
     def _collate_batch(self, batch):
+        # 保存非numpy字段（如_dataset_start_idx和_dataset_set_name）
+        extra_fields = {}
+        for k in list(batch.keys()):
+            if k.startswith('_'):
+                extra_fields[k] = batch.pop(k)
+        
         # Convert dtype
         batch = {k: v.astype(np.int32) for k, v in batch.items()}
+
+        # 恢复为4行格式：inputs和labels都使用完整的4行
+        # 数据存储格式是4行×grid_width列，直接使用完整的4行
+        # - inputs: 完整的4行（题目+初始状态）
+        # - labels: 完整的4行（目标状态）
+        # 不需要提取或转换，直接使用原始数据
 
         # Convert ignore label IDs
         if self.metadata.ignore_label_id is not None:
@@ -163,35 +176,62 @@ class PuzzleDataset(IterableDataset):
             batch = {k: np.pad(v, ((0, pad_size), ) + ((0, 0), ) * (v.ndim - 1), constant_values=pad_values[k]) for k, v in batch.items()}
 
         # To tensor
-        return {k: torch.from_numpy(v) for k, v in batch.items()}
+        result = {k: torch.from_numpy(v) for k, v in batch.items()}
+        
+        # 处理_input_row34：转换为tensor
+        if "_input_row34" in extra_fields:
+            result["_input_row34"] = torch.from_numpy(extra_fields["_input_row34"])
+        # 添加其他非numpy字段（保持原始类型）
+        for k, v in extra_fields.items():
+            if k != "_input_row34":
+                result[k] = v
+        return result
     
     def _iter_test(self):
         for set_i, (set_name, dataset) in enumerate(self._data.items()):  # type: ignore
-            total_examples = len(dataset["inputs"])
-
+            # 在评估模式下，使用所有步骤的数据（用于单步状态转换的评估）
+            # 按顺序遍历所有样本，不随机打乱
+            puzzle_identifiers = dataset["puzzle_identifiers"]
+            total_samples = len(dataset["inputs"])
+            
+            # 如果指定了start_puzzle_id，只返回从该puzzle_id开始的样本
+            if self.config.start_puzzle_id is not None:
+                # 找到所有puzzle_id >= start_puzzle_id的样本索引
+                valid_mask = puzzle_identifiers >= self.config.start_puzzle_id
+                all_indices = np.where(valid_mask)[0].astype(np.int64)
+                if len(all_indices) == 0:
+                    print(f"警告: 没有找到puzzle_id >= {self.config.start_puzzle_id}的样本")
+                    continue
+                filtered_total_samples = len(all_indices)
+            else:
+                # 直接使用所有样本的索引（按顺序）
+                all_indices = np.arange(total_samples, dtype=np.int64)
+                filtered_total_samples = total_samples
+            
             # Load examples one by one
             start_index = 0
-            while start_index < total_examples:
+            while start_index < filtered_total_samples:
                 # Compute indices
-                end_index = min(total_examples, start_index + self.config.global_batch_size)
+                end_index = min(filtered_total_samples, start_index + self.config.global_batch_size)
                 
                 local_start = start_index + self.config.rank * self.local_batch_size
                 local_end   = min(start_index + (self.config.rank + 1) * self.local_batch_size, end_index)
                 
-                # Get batch of examples, and also puzzle IDs
-                puzzle_indices = []
-                puzzle_index = np.searchsorted(dataset["puzzle_indices"], local_start, side="right") - 1
-                for i in range(local_start, local_end):
-                    while puzzle_index + 1 < len(dataset["puzzle_indices"]) and i >= dataset["puzzle_indices"][puzzle_index + 1]:
-                        puzzle_index += 1
-
-                    puzzle_indices.append(puzzle_index)
+                # 获取当前batch的索引
+                batch_indices = all_indices[local_start: local_end]
+                
+                # 获取对应的puzzle identifiers
+                batch_puzzle_identifiers = dataset["puzzle_identifiers"][batch_indices]
                 
                 batch = self._collate_batch({
-                    "inputs": dataset["inputs"][local_start: local_end],
-                    "labels": dataset["labels"][local_start: local_end],
-                    "puzzle_identifiers": dataset["puzzle_identifiers"][puzzle_indices]
+                    "inputs": dataset["inputs"][batch_indices],
+                    "labels": dataset["labels"][batch_indices],
+                    "puzzle_identifiers": batch_puzzle_identifiers
                 })
+                
+                # 保存索引和set_name（用于兼容性）
+                batch["_dataset_start_idx"] = batch_indices[0] if len(batch_indices) > 0 else 0
+                batch["_dataset_set_name"] = set_name
 
                 yield set_name, batch, end_index - start_index
                 
